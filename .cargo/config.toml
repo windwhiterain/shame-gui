@@ -1,0 +1,11 @@
+# Local development override — not committed.
+# When this file exists, cargo uses the local path instead of git.
+# Delete this file or move it aside to test against the published git dependency.
+
+[net]
+git-fetch-with-cli = true
+
+[patch.'ssh://git@github.com/windwhiterain/shame.git']
+shame = { path = "../shame/shame" }
+shame_wgpu = { path = "../shame/shame_wgpu" }
+shame_derive = { path = "../shame/shame_derive" }
