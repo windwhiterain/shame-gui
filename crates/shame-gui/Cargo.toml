@@ -1,0 +1,19 @@
+[package]
+name = "shame-gui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+shame.workspace = true
+shame_wgpu.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+bytemuck.workspace = true
+pollster.workspace = true
+shame_gui_derive = { path = "../shame_gui_derive" }
+taffy = "0.13.0"
+glyphon = "0.11"
+cosmic-text = "0.18"
+
+[dev-dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png"] }

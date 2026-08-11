@@ -1,0 +1,16 @@
+[workspace]
+members = ["crates/shame-gui", "crates/shame_gui_derive"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+shame = { git = "ssh://git@github.com/windwhiterain/shame.git", tag = "v3.0.0" }
+shame_wgpu = { git = "ssh://git@github.com/windwhiterain/shame.git", tag = "v3.0.0" }
+shame_derive = { git = "ssh://git@github.com/windwhiterain/shame.git", tag = "v3.0.0" }
+wgpu = "29.0.4"
+winit = "0.30.13"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+pollster = "1.0.1"
