@@ -247,18 +247,36 @@ impl<K: Clone + Eq + std::hash::Hash + 'static, V: Clone + 'static, S> Port<Hash
         })
     }
 
-    /// Inserts `value` at `key`. Marks the map port dirty; the map node
-    /// reprocesses only the new key (via the key-set structural diff).
+    /// Inserts `value` at `key`. Marks the map port dirty and records the key
+    /// in the map's dirty record: a **new** key is marked `added` (the map
+    /// node processes it once), an **overwrite** is marked `full` (the whole
+    /// element was replaced, so it reprocesses and any stale nested records
+    /// are not trusted).
     pub fn insert(&self, r: &mut DagStructRef<'_, S>, key: K, value: V) {
-        self.read_mut_state(r.inner_mut())
-            .insert(key.clone(), value);
+        let existed = self
+            .read_mut_state(r.inner_mut())
+            .insert(key.clone(), value)
+            .is_some();
+        r.with_map_dirty::<K>(self.id(), |m| {
+            let ed = m.keys.entry(key).or_insert_with(ElemDirty::new);
+            if existed {
+                ed.full = true;
+            } else {
+                ed.added = true;
+            }
+        });
         r.mark_dirty(self.id);
     }
 
-    /// Removes `key`, marking the map port dirty so the map node drops it.
+    /// Removes `key`, marking the map port dirty and recording the key as
+    /// `removed` in the map's dirty record so downstream readers re-run (the
+    /// element itself is already gone, so it is never reprocessed).
     pub fn remove(&self, r: &mut DagStructRef<'_, S>, key: K) -> Option<V> {
         let removed = self.read_mut_state(r.inner_mut()).remove(&key);
         if removed.is_some() {
+            r.with_map_dirty::<K>(self.id(), |m| {
+                m.keys.entry(key).or_insert_with(ElemDirty::new).removed = true;
+            });
             r.mark_dirty(self.id);
         }
         removed

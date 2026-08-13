@@ -22,20 +22,37 @@ use crate::graph::port::PortId;
 /// Dirty tracking for a single element (`key`) of a map port.
 #[derive(Clone)]
 pub(crate) struct ElemDirty {
-    /// The whole element was mutated via `MapEntry::read_mut()` → reprocess it
-    /// regardless of which element ports the node reads.
+    /// The whole element was mutated (`MapEntry::read_mut()`, or an
+    /// overwriting `Port::insert`) → reprocess it regardless of which element
+    /// ports the node reads.
     pub full: bool,
+    /// The key was newly inserted via `Port::insert` → process the new
+    /// element once.
+    pub added: bool,
+    /// The key was removed via `Port::remove` → no reprocessing, but
+    /// downstream readers must re-run.
+    pub removed: bool,
     /// Element ports dirtied by an element eval's `Port::write`/`read_mut`.
     /// Shared with the element eval's [`DagStructRef`] so writes inside the
     /// eval land here and are visible to downstream map nodes.
     pub ports: Rc<RefCell<HashSet<PortId>>>,
+    /// This element's own nested-map dirty records, keyed by the nested
+    /// map's `PortId` within the element state. Recursive: each nested
+    /// `ElemDirty` may carry a further `nested`, so arbitrary depth needs no
+    /// new key type and no cross-state `PortId` collision (scope is
+    /// structural — the inner `PortId` lives inside the outer key's
+    /// `ElemDirty`).
+    pub nested: Rc<RefCell<HashMap<PortId, Box<dyn Any>>>>,
 }
 
 impl ElemDirty {
     pub(crate) fn new() -> Self {
         Self {
             full: false,
+            added: false,
+            removed: false,
             ports: Rc::new(RefCell::new(HashSet::new())),
+            nested: Rc::new(RefCell::new(HashMap::new())),
         }
     }
 }
@@ -128,7 +145,11 @@ impl<'a, S> DagStructRef<'a, S> {
     /// Ensures a [`MapDirty<K>`] record exists for `id` and calls `f` with it.
     /// The `RefMut` temporary is confined to this method, so `f` can mutate
     /// but not escape the record.
-    fn with_map_dirty<K: 'static>(&mut self, id: PortId, f: impl FnOnce(&mut MapDirty<K>)) {
+    pub(crate) fn with_map_dirty<K: 'static>(
+        &mut self,
+        id: PortId,
+        f: impl FnOnce(&mut MapDirty<K>),
+    ) {
         let mut map = self.map_dirty.borrow_mut();
         let entry = map
             .entry(id)
@@ -183,6 +204,33 @@ impl<'a, S> DagStructRef<'a, S> {
             .entry(key)
             .or_insert_with(ElemDirty::new)
             .ports
+            .clone()
+    }
+
+    /// Returns (creating if absent) the shared nested-map dirty store for a
+    /// specific element of a map port. An element eval's [`DagStructRef`]
+    /// uses this as its `map_dirty`, so nested-map writes inside the eval
+    /// land here and are visible to nested fan-out nodes.
+    pub(crate) fn ensure_elem_nested<K>(
+        &mut self,
+        id: PortId,
+        key: K,
+    ) -> Rc<RefCell<HashMap<PortId, Box<dyn Any>>>>
+    where
+        K: Clone + Eq + std::hash::Hash + 'static,
+    {
+        let mut map = self.map_dirty.borrow_mut();
+        let entry = map
+            .entry(id)
+            .or_insert_with(|| Box::new(MapDirty::<K>::new()));
+        let record = entry
+            .downcast_mut::<MapDirty<K>>()
+            .expect("map dirty record type mismatch");
+        record
+            .keys
+            .entry(key)
+            .or_insert_with(ElemDirty::new)
+            .nested
             .clone()
     }
 
