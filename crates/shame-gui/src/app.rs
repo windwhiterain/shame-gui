@@ -13,6 +13,7 @@
 //! creates the bind group.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::num::NonZero;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -31,7 +32,7 @@ use crate::graph::{AppState, BuiltinState, DagStructRef, Graph, Port};
 use crate::gui::Gui;
 use crate::gui::event::InputEvent;
 use crate::instance::GpuStruct;
-use crate::material::{GpuBufferSlot, InstanceArena, InstanceBuffer, Material};
+use crate::material::{GpuBufferSlot, GpuInstanceBuffer, InstanceArena, InstanceBuffer, Material};
 use crate::math::{Vec2, Vec2u};
 use crate::shader::{RectInstance, RectMaterial, ViewportParams, WireframeMaterial};
 use crate::text::TextSystem;
@@ -297,6 +298,97 @@ impl<S: AppState> App<S> {
                 None,
             );
         }
+
+        let has_fb = M::HAS_FB_PUSH_CONSTANT;
+        self.pending_batched_groups.push(BatchedGroupSlot {
+            arena,
+            has_fb_in_push_constant: has_fb,
+            material_slot: None,
+            register_material: Some(Box::new(move |canvas: &mut Canvas<S>, gpu| {
+                canvas.register_material(gpu, M::default()).index
+            })),
+            read_push_constant: push_bytes::<M::PushConstant, S>(constant),
+        });
+
+        self
+    }
+
+    /// Registers a dynamic `HashMap<K, E>` of render objects that share one
+    /// material and one push constant, batched into a single indirect dispatch.
+    ///
+    /// Each element carries its own CPU [`InstanceBuffer`] (filled by the user)
+    /// and an [`Option<GpuInstanceBuffer>`] handle that the framework writes
+    /// after uploading. From the element's perspective this handle *is* its GPU
+    /// buffer — the shared-buffer/arena bookkeeping is internal. Dropping an
+    /// element (its key is removed from the map) releases its GPU buffer
+    /// automatically.
+    ///
+    /// - `map` — the dynamic map port.
+    /// - `material` — a `Port<M, S>` holding the material (shared pipeline).
+    /// - `constant` — a `Port<M::PushConstant, S>` holding the shared push
+    ///   constant (identical across all elements).
+    /// - `cpu_buffer` — the element's `InstanceBuffer<M::Instance>` port.
+    /// - `gpu_buffer` — the element's `Option<GpuInstanceBuffer>` port.
+    pub fn register_map_render_objects_batched<M, K, E>(
+        &mut self,
+        map: Port<HashMap<K, E>, S>,
+        material: Port<M, S>,
+        constant: Port<M::PushConstant, S>,
+        cpu_buffer: Port<InstanceBuffer<M::Instance>, E>,
+        gpu_buffer: Port<Option<GpuInstanceBuffer>, E>,
+    ) -> &mut Self
+    where
+        M: Material,
+        K: Clone + Eq + std::hash::Hash + 'static,
+        E: Clone + 'static,
+        M::PushConstant: crate::graph::PortValue,
+    {
+        let wire_size = <M::Instance as GpuStruct>::wire_size();
+        let arena = Rc::new(RefCell::new(InstanceArena::new(wire_size)));
+        let arena2 = arena.clone();
+
+        self.graph.add_map_node(
+            map,
+            material,
+            (),
+            cpu_buffer,
+            gpu_buffer,
+            move |_gref: &mut DagStructRef<S>,
+                  gpu: Option<&sm::Gpu>,
+                  _k: &K,
+                  eref: &mut DagStructRef<E>| {
+                let Some(gpu) = gpu else { return };
+                let cpu: &InstanceBuffer<M::Instance> = cpu_buffer.read(eref);
+                let is_empty = cpu.is_empty();
+                let bytes = cpu.as_bytes().to_vec();
+                let count = cpu.instance_count();
+
+                if is_empty {
+                    // Releasing the handle frees the element's GPU slice.
+                    gpu_buffer.write(eref, None);
+                    return;
+                }
+
+                let (slot, is_new) = match gpu_buffer.read(eref) {
+                    Some(handle) => (handle.slot(), false),
+                    None => (arena2.borrow_mut().add_slot(), true),
+                };
+
+                let bytes_len = bytes.len().max(1) as u32;
+                {
+                    let mut arena = arena2.borrow_mut();
+                    let offset = arena.alloc_for_slot(slot, count, bytes_len);
+                    let needed = arena.committed_size();
+                    arena.ensure_capacity(gpu, needed);
+                    arena.upload(gpu, offset, if bytes.is_empty() { &[0u8] } else { &bytes });
+                }
+
+                if is_new {
+                    let handle = GpuInstanceBuffer::new(arena2.clone(), slot);
+                    gpu_buffer.write(eref, Some(handle));
+                }
+            },
+        );
 
         let has_fb = M::HAS_FB_PUSH_CONSTANT;
         self.pending_batched_groups.push(BatchedGroupSlot {

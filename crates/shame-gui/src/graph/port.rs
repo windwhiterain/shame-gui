@@ -39,8 +39,10 @@ impl PortValue for () {}
 impl PortValue for Vec<crate::shader::RectEntry> {}
 impl PortValue for Vec<crate::text::TextObject> {}
 impl PortValue for Vec<u8> {}
+impl PortValue for crate::shader::ViewportParams {}
 impl PortValue for Option<Arc<GpuBufferSlot>> {}
 impl PortValue for Option<Arc<wgpu::BindGroup>> {}
+impl PortValue for Option<crate::material::GpuInstanceBuffer> {}
 
 impl<K: Clone + Eq + std::hash::Hash + 'static, V: Clone + 'static> PortValue
     for std::collections::HashMap<K, V>

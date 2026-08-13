@@ -7,9 +7,11 @@
 //! `RectMaterial` / `WireframeMaterial` are the reference implementations.
 
 use std::any::{Any, TypeId};
+use std::cell::RefCell;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::num::NonZero;
+use std::rc::Rc;
 
 use shame_wgpu as sm;
 
@@ -413,6 +415,61 @@ impl InstanceArena {
         gpu.queue()
             .write_buffer(self.args_buffer.as_ref().unwrap(), 0, &bytes);
         self.args_buffer.as_ref()
+    }
+}
+
+/// A handle to an element's instance data in the shared batched GPU buffer.
+///
+/// From the user's perspective this *is* the element's GPU buffer: it is
+/// written by [`App::register_map_render_objects_batched`](crate::app::App::register_map_render_objects_batched)
+/// after the CPU [`InstanceBuffer`] is uploaded, and it releases its GPU
+/// storage automatically when the element is dropped (a key is removed from
+/// the map). The arena/slice bookkeeping behind it is an implementation
+/// detail.
+pub struct GpuInstanceBuffer {
+    inner: Rc<GpuBufferGuard>,
+}
+
+/// Owning guard for one element's region in a shared [`InstanceArena`].
+/// Dropping the last clone releases the element's slice.
+struct GpuBufferGuard {
+    arena: Rc<RefCell<InstanceArena>>,
+    slot: usize,
+}
+
+impl Drop for GpuBufferGuard {
+    fn drop(&mut self) {
+        self.arena.borrow_mut().free_slot(self.slot);
+    }
+}
+
+impl Clone for GpuInstanceBuffer {
+    /// Clones the handle (shares the underlying GPU buffer), rather than
+    /// duplicating ownership — so an element clone during map processing does
+    /// not release the buffer early.
+    fn clone(&self) -> Self {
+        Self {
+            inner: Rc::clone(&self.inner),
+        }
+    }
+}
+
+impl PartialEq for GpuInstanceBuffer {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner.slot == other.inner.slot
+    }
+}
+impl Eq for GpuInstanceBuffer {}
+
+impl GpuInstanceBuffer {
+    pub(crate) fn new(arena: Rc<RefCell<InstanceArena>>, slot: usize) -> Self {
+        Self {
+            inner: Rc::new(GpuBufferGuard { arena, slot }),
+        }
+    }
+
+    pub(crate) fn slot(&self) -> usize {
+        self.inner.slot
     }
 }
 

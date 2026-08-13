@@ -18,10 +18,10 @@
 
 ## Workspace layout
 
-- `crates/shame-gui/src/app.rs` — `App<S: AppState = BuiltinState>`. `App::new(title)`, `.add_gui(gui)`, `.run(ts)`, `graph_mut()`/`graph()`, `state_mut()`/`state()`, `step(...)`. `register_render_object::<M>(material, cpu_buffer, constant, gpu_buffer, bind_group)` — **all five ports are declared fields in `S`** (material + `InstanceBuffer<M::Instance>` + `M::PushConstant` + `Option<Arc<GpuBufferSlot>>` + `Option<Arc<wgpu::BindGroup>>`). Two internal DAG nodes: upload (`cpu_buffer` → wgpu buffer) and bind group (`gpu_buffer` + `material` → bind group).
+- `crates/shame-gui/src/app.rs` — `App<S: AppState = BuiltinState>`. `App::new(title)`, `.add_gui(gui)`, `.run(ts)`, `graph_mut()`/`graph()`, `state_mut()`/`state()`, `step(...)`. `register_render_object::<M>(material, cpu_buffer, constant, gpu_buffer, bind_group)` — **all five ports are declared fields in `S`** (material + `InstanceBuffer<M::Instance>` + `M::PushConstant` + `Option<Arc<GpuBufferSlot>>` + `Option<Arc<wgpu::BindGroup>>`). Two internal DAG nodes: upload (`cpu_buffer` → wgpu buffer) and bind group (`gpu_buffer` + `material` → bind group). Batched variants: `register_render_objects_batched` (static list) and `register_map_render_objects_batched` (dynamic map) — see "Batched render objects".
 - `crates/shame-gui/src/graph/` — `port.rs` (`Port`, `PortId`, `PortGroup`, `PortValue`, `DagStruct`, `IdGroup`), `element.rs` (`DagStructRef`), `state.rs` (`BuiltinState`, `AppState`, `SourcePorts`, `RenderPorts`), `graph.rs` (`Graph<S>`, `add_node`, `add_map_node`, `tick`).
 - `crates/shame-gui/src/canvas.rs` — `pub(crate) Canvas<S>`: material registry, one draw call per material per frame. `RenderSlot<S>` holds typed `Port<_, S>` handles (not raw `PortId`). Takes an external `CommandEncoder`.
-- `crates/shame-gui/src/material.rs` — `Material`, `InstanceBuffer`, `GpuBufferSlot`, `MakeBindGroupFn`.
+- `crates/shame-gui/src/material.rs` — `Material`, `InstanceBuffer`, `GpuBufferSlot`, `InstanceArena` (shared batched buffer), `GpuInstanceBuffer` (RAII GPU-buffer handle), `MakeBindGroupFn`.
 - `crates/shame-gui/src/instance.rs` + `crates/shame_gui_derive` — `#[derive(GpuStruct)]`: GPU twin, layout, serialize, bind group, `{Name}Like<const GPU>`.
 - `crates/shame-gui/src/math.rs` — `Vec2`, `Vec4`, `Vec2u`, `Vec2i`, `Rect`. `#[repr(C)]`, `Pod`/`Zeroable`, `PartialEq`. Derive `DagStruct` to get `{Name}Ports`.
 - `crates/shame-gui/src/color.rs` — `Color` (sRGB, CPU-only, NOT `GpuStruct`). Use `to_linear()` for instance data.
@@ -130,14 +130,21 @@ graph.add_map_node(
 );
 ```
 
-- The node **diffs the map against a private `prev` snapshot** each tick, so **only changed keys are reprocessed** and only changed entries are re-allocated in the map. Removed keys are dropped from the output.
-- `E: Clone + PartialEq` (needed for the diff). The eval clones each changed element, wraps it in `DagStructRef<E>`, runs the closure, and writes the result back.
-- `global_in`/`global_out`/`elem_in`/`elem_out` are **separate parameters** so the graph can distinguish global (`S`) from element (`E`) ports — the two are different types.
+- The node keeps a private `known_keys: HashSet<K>` and **diffs structurally** against the map each tick (plus per-key dirty records via `snapshot_map_dirty`/`ensure_elem_ports`), so **only changed keys are reprocessed**. Removed keys are dropped from the output.
+- `E: Clone + 'static` (no `PartialEq` needed). The eval clones each changed element, wraps it in a `DagStructRef<E>` that **shares the element's port dirty set**, runs the closure, and writes the result back. `global_in`/`global_out`/`elem_in`/`elem_out` are separate parameters because `S` and `E` are different types.
 - Reference: `examples/dynamic_map.rs` + `tests/dynamic_map.rs`.
 
 **Widget → DAG bridge:** widgets write through `DagStructRef` (`Port::write`), auto-marking ports dirty; the graph re-runs nodes reading them on the next tick. No manual `mark_dirty` wiring.
 
 **DAG-produced custom render objects** (`App::register_render_object`): material + instance buffer + push constant + gpu buffer + bind group are all **declared fields of `S`**. Two internal nodes upload the buffer and build the bind group. Canvas reads them from the state each frame.
+
+## Batched render objects (indirect draw)
+
+Both batched paths funnel into one shared `InstanceArena` (grow-only storage buffer + free-list + indirect args buffer) and issue **one `multi_draw_indexed_indirect` per group**. Canvas builds the bind group (no DAG bind node). `gpu.rs` requires `Features::INDIRECT_FIRST_INSTANCE`.
+
+- `register_render_objects_batched<M>(material, constant, cpu_buffers)` — **static**: a fixed list of `Port<InstanceBuffer<M::Instance>, S>`; one upload `add_node` per object into its own arena slot. Reference: `tests/snapshot_batched_indirect.rs`.
+- `register_map_render_objects_batched<M,K,E>(map, material, constant, cpu_buffer, gpu_buffer)` — **dynamic**: `HashMap<K,E>` where each element carries `cpu_buffer: InstanceBuffer<M::Instance>` (user-filled) + `gpu_buffer: Option<GpuInstanceBuffer>` (framework-written). One `add_map_node` uploads per changed key; `GpuInstanceBuffer` is RAII (`Rc` + `Drop` → `free_slot`), so removing a key releases its slice automatically — **no reconcile node**. Reference: `examples/dynamic_map_gpu.rs` + `tests/snapshot_map_batched_indirect.rs`.
+- One draw = one bind group + one push constant: batch only objects/elements sharing the same material value and identical push-constant bytes. `ViewportParams` implements `PortValue`, so the built-in `RectMaterial`/`WireframeMaterial` work in both batched APIs.
 
 ## ViewportRect — custom widget rendering (`gui/primitives/viewport_rect.rs`)
 
@@ -155,6 +162,7 @@ graph.add_map_node(
 - `App::step(inputs, dt, elapsed, cursor, fb_size)` — CPU-only frame simulation; derives `mouse_down`/cursor from `inputs`.
 - `AppRunner<S>::after_tick(&AppContext<'a, S>) -> Vec<InputEvent>` — events injected next `step()` (one-frame lag). `AppContext` exposes `state: &S`, `graph: &Graph<S>`, `gui: Option<&Gui<S>>`.
 - Snapshot tests are their own binaries; goldens auto-accept on first run.
+- GPU snapshot binaries run in parallel under `cargo test`; rarely a first-frame capture reads a not-yet-sized surface and panics with a size mismatch. Re-run the single failing binary to confirm before treating it as a regression.
 - Widget unit tests: `DagStructRef::new(&mut state)` gives isolated dirty tracking; call `port.on_event(&mut r, &mut data, &event, rect)`.
 - Scene functions must use `app.state_mut()` (not a separate local state) — ports reference `S` by type, and a mismatched state produces the wrong accessors at render time.
 
