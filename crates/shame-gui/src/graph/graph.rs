@@ -254,83 +254,9 @@ impl<S: DagStruct> Graph<S> {
         self.add_node(
             move |gref: &mut DagStructRef<S>, gpu: Option<&sm::Gpu>| {
                 let global_refresh = global_in_ids.iter().any(|id| gref.is_dirty(*id));
-
-                // Snapshot the map's dirty record (consumed conceptually; the
-                // record itself is cleared at end of tick). The clone shares
-                // the per-key `Rc` handles, so element-port sets and nested
-                // stores are read live.
-                let md = gref.snapshot_map_dirty::<K>(map_in.id());
-
-                // Phase A: decide which keys to process / which were removed
-                // (borrows the map, then releases before writing back).
-                // Record-driven: `Port::insert`/`remove`/`read_mut` and
-                // whole-map writes all record the exact keys in `md`, so no
-                // structural diff is needed.
-                let (to_process, removed_keys): (Vec<(K, E)>, Vec<K>) = {
-                    let cur: &HashMap<K, E> = map_in.read(gref);
-                    let mut to_process = Vec::new();
-                    let mut removed_keys = Vec::new();
-
-                    if md.full || global_refresh || !started {
-                        // Whole-map write, global refresh, or first run →
-                        // reprocess every current key.
-                        started = true;
-                        to_process.extend(cur.iter().map(|(k, v)| (k.clone(), v.clone())));
-                    } else {
-                        // Per-key dirty records: new inserts, whole-element
-                        // mutations, removed keys, or an element-port write
-                        // that overlaps this node's reads.
-                        for (k, ed) in &md.keys {
-                            if !cur.contains_key(k) {
-                                if ed.removed {
-                                    removed_keys.push(k.clone());
-                                }
-                                continue;
-                            }
-                            if ed.added || ed.full {
-                                to_process.push((k.clone(), cur[k].clone()));
-                            } else {
-                                let ports = ed.ports.borrow();
-                                if elem_in_ids.iter().any(|id| ports.contains(id)) {
-                                    to_process.push((k.clone(), cur[k].clone()));
-                                }
-                            }
-                        }
-                    }
-                    (to_process, removed_keys)
-                };
-
-                // Phase B: process changed elements, sharing this key's
-                // element-port dirty set and nested map-dirty store with the
-                // eval so its writes (and nested-map writes) propagate.
-                let mut wrote = false;
-                for (k, e) in to_process {
-                    let ports_rc = gref.ensure_elem_ports::<K>(map_in.id(), k.clone());
-                    let nested = gref.ensure_elem_nested::<K>(map_in.id(), k.clone());
-                    let mut e2 = e;
-                    {
-                        // Fired is isolated (no consumer yet); the element
-                        // shares the port dirty set and the nested store.
-                        let fired = Rc::new(RefCell::new(HashSet::new()));
-                        let mut eref = DagStructRef::new_with(&mut e2, ports_rc, fired, nested);
-                        eval(&mut *gref, gpu, &k, &mut eref);
-                    }
-                    map_out.read_mut_state(gref.inner_mut()).insert(k, e2);
-                    wrote = true;
-                }
-
-                // Phase C: removed keys are already gone from the map; signal
-                // downstream so non-map readers re-derive.
-                if !removed_keys.is_empty() {
-                    wrote = true;
-                }
-
-                // Propagate the map change to downstream (non-map) readers.
-                // Deliberately avoids `map_out.write`/`read_mut` so the map
-                // node's own write-back does not re-record a full change.
-                if wrote {
-                    gref.mark_dirty(map_out.id());
-                }
+                let full = global_refresh || !started;
+                started = true;
+                run_map_fanout(gref, gpu, map_in, &elem_in_ids, full, &mut eval);
             },
             (global_in, map_in),
             (global_out, map_out),
@@ -344,6 +270,130 @@ impl<S: DagStruct> Graph<S> {
         // `elem_out` is consumed only for its type/group at the call site; the
         // actual per-element-port dirty propagation happens through the shared
         // element-port set inside the eval.
+        let _ = elem_out;
+    }
+
+    /// Registers a **nested** fan-out: the elements of an outer map are
+    /// states that hold their own `HashMap` field, and this node fans out
+    /// over that inner map per element.
+    ///
+    /// The graph stays flat — this registers one more node over the outer
+    /// map whose eval iterates the outer map and drives the same fan-out
+    /// phases per element over the element's inner map. The element's nested
+    /// dirty records (shared into the element's `DagStructRef` by the outer
+    /// map node) tell the node exactly which inner keys changed, so only
+    /// those reprocess.
+    ///
+    /// - `outer_map` — the outer `Port<HashMap<A, E>, S>`; typically also
+    ///   registered as a map node. Register this node **before** that one, so
+    ///   its per-element marks reach the outer node's `elem_in` in the same
+    ///   tick (map↔map edges are skipped in topo sort, so insertion order
+    ///   governs).
+    /// - `inner_map` — a `Port<HashMap<B, L>, E>` map field of the element
+    ///   state.
+    /// - `elem_in` / `elem_out` — element (`L`) ports the eval reads/writes.
+    /// - `eval` — `FnMut(&mut DagStructRef<E>, Option<&Gpu>, &B,
+    ///   &mut DagStructRef<L>)`; the first argument is the element itself.
+    ///
+    /// An element gets a **full inner pass** when it is fresh — newly
+    /// inserted, overwritten, whole-element `MapEntry::read_mut`,
+    /// whole-outer-map write, or this node's first run; otherwise only the
+    /// inner keys recorded by the element's nested dirty store are
+    /// reprocessed. The outer map port is marked dirty on any write, so
+    /// non-map readers re-derive in the same tick.
+    pub fn add_map_node_nested<A, E, B, L, F>(
+        &mut self,
+        outer_map: Port<HashMap<A, E>, S>,
+        inner_map: Port<HashMap<B, L>, E>,
+        elem_in: impl PortGroup<L>,
+        elem_out: impl PortGroup<L>,
+        eval: F,
+    ) where
+        A: Clone + Eq + std::hash::Hash + 'static,
+        E: Clone + 'static,
+        B: Clone + Eq + std::hash::Hash + 'static,
+        L: Clone + 'static,
+        F: FnMut(&mut DagStructRef<E>, Option<&sm::Gpu>, &B, &mut DagStructRef<L>) + 'static,
+    {
+        let outer_id = outer_map.id();
+        let inner_id = inner_map.id();
+        let elem_in_ids = elem_in.ids();
+        let outer_in = outer_map;
+        let outer_out = outer_map;
+        let mut started = false;
+        let mut eval = eval;
+
+        self.add_node(
+            move |gref: &mut DagStructRef<S>, gpu: Option<&sm::Gpu>| {
+                // The outer record's clone shares the per-element `Rc`
+                // handles, so `keys[a].nested` reads the live nested records.
+                let md = gref.snapshot_map_dirty::<A>(outer_id);
+
+                let mut wrote = false;
+
+                if !started || md.full {
+                    // First run, or the whole outer map was rewritten → full
+                    // inner pass over every current element.
+                    started = true;
+                    for a in outer_in.read(gref).keys().cloned().collect::<Vec<_>>() {
+                        wrote |= process_nested_element(
+                            gref,
+                            gpu,
+                            outer_in,
+                            &a,
+                            inner_map,
+                            &elem_in_ids,
+                            true,
+                            &mut eval,
+                        );
+                    }
+                } else {
+                    // Record-driven: elements that are fresh per the outer
+                    // record (insert / overwrite / whole-element mutation),
+                    // or whose nested record has changes for our inner map.
+                    let keys: Vec<(A, bool)> = {
+                        let cur = outer_in.read(gref);
+                        md.keys
+                            .iter()
+                            .filter(|(a, ed)| {
+                                cur.contains_key(a)
+                                    && (ed.added
+                                        || ed.full
+                                        || ed.nested.borrow().contains_key(&inner_id))
+                            })
+                            .map(|(a, ed)| (a.clone(), ed.added || ed.full))
+                            .collect()
+                    };
+                    for (a, fresh) in keys {
+                        wrote |= process_nested_element(
+                            gref,
+                            gpu,
+                            outer_in,
+                            &a,
+                            inner_map,
+                            &elem_in_ids,
+                            fresh,
+                            &mut eval,
+                        );
+                    }
+                }
+
+                // Propagate to downstream (non-map) readers.
+                if wrote {
+                    gref.mark_dirty(outer_id);
+                }
+            },
+            outer_in,
+            outer_out,
+            None,
+        );
+
+        // Tag this node as a map node over the outer map, so topo sort can
+        // break map↔map cycles with the outer map node (insertion order
+        // governs their run order).
+        self.nodes.last_mut().expect("just added a node").map_port = Some(outer_id);
+
+        // `elem_out` is consumed only for its type/group at the call site.
         let _ = elem_out;
     }
 
@@ -404,5 +454,145 @@ impl<S: DagStruct> Graph<S> {
 
         self.dirty.borrow_mut().clear();
         self.map_dirty.borrow_mut().clear();
+    }
+}
+
+/// One level of map fan-out, shared by [`Graph::add_map_node`] and nested
+/// nodes ([`Graph::add_map_node_nested`]).
+///
+/// Decides which keys to reprocess from the map port's dirty record — no
+/// structural diff: `Port::insert`/`remove`/`read_mut` and whole-map writes
+/// all record the exact keys — then runs `eval` per changed element and
+/// writes the results back. Returns true if anything was written.
+///
+/// `full` forces a full refresh (every current key reprocessed); the record's
+/// own `full` flag is OR-ed in. When anything is written, the map port is
+/// marked dirty so downstream (non-map) readers re-run.
+fn run_map_fanout<S, K, E, F>(
+    gref: &mut DagStructRef<S>,
+    gpu: Option<&sm::Gpu>,
+    map: Port<HashMap<K, E>, S>,
+    elem_in_ids: &[PortId],
+    full: bool,
+    eval: &mut F,
+) -> bool
+where
+    K: Clone + Eq + std::hash::Hash + 'static,
+    E: Clone + 'static,
+    F: FnMut(&mut DagStructRef<S>, Option<&sm::Gpu>, &K, &mut DagStructRef<E>),
+{
+    // Snapshot the map's dirty record (consumed conceptually; the record
+    // itself is cleared at end of tick). The clone shares the per-key `Rc`
+    // handles, so element-port sets and nested stores are read live.
+    let md = gref.snapshot_map_dirty::<K>(map.id());
+    let full = full || md.full;
+
+    // Phase A: decide which keys to process / which were removed (borrows
+    // the map, then releases before writing back). Record-driven:
+    // `Port::insert`/`remove`/`read_mut` and whole-map writes all record the
+    // exact keys in `md`, so no structural diff is needed.
+    let (to_process, removed_keys): (Vec<(K, E)>, Vec<K>) = {
+        let cur: &HashMap<K, E> = map.read(gref);
+        let mut to_process = Vec::new();
+        let mut removed_keys = Vec::new();
+
+        if full {
+            // Whole-map write, global refresh, or first run → reprocess every
+            // current key.
+            to_process.extend(cur.iter().map(|(k, v)| (k.clone(), v.clone())));
+        } else {
+            // Per-key dirty records: new inserts, whole-element mutations,
+            // removed keys, or an element-port write that overlaps this
+            // node's reads.
+            for (k, ed) in &md.keys {
+                if !cur.contains_key(k) {
+                    if ed.removed {
+                        removed_keys.push(k.clone());
+                    }
+                    continue;
+                }
+                if ed.added || ed.full {
+                    to_process.push((k.clone(), cur[k].clone()));
+                } else {
+                    let ports = ed.ports.borrow();
+                    if elem_in_ids.iter().any(|id| ports.contains(id)) {
+                        to_process.push((k.clone(), cur[k].clone()));
+                    }
+                }
+            }
+        }
+        (to_process, removed_keys)
+    };
+
+    // Phase B: process changed elements, sharing this key's element-port
+    // dirty set and nested map-dirty store with the eval so its writes (and
+    // nested-map writes) propagate.
+    let mut wrote = false;
+    for (k, e) in to_process {
+        let ports_rc = gref.ensure_elem_ports::<K>(map.id(), k.clone());
+        let nested = gref.ensure_elem_nested::<K>(map.id(), k.clone());
+        let mut e2 = e;
+        {
+            // Fired is isolated (no consumer yet); the element shares the
+            // port dirty set and the nested store.
+            let fired = Rc::new(RefCell::new(HashSet::new()));
+            let mut eref = DagStructRef::new_with(&mut e2, ports_rc, fired, nested);
+            eval(gref, gpu, &k, &mut eref);
+        }
+        map.read_mut_state(gref.inner_mut()).insert(k, e2);
+        wrote = true;
+    }
+
+    // Phase C: removed keys are already gone from the map; signal downstream
+    // so non-map readers re-derive.
+    if !removed_keys.is_empty() {
+        wrote = true;
+    }
+
+    // Propagate the map change to downstream (non-map) readers. Deliberately
+    // avoids `map.write`/`read_mut` so the write-back does not re-record a
+    // full change. (For a nested call this marks the inner map port in the
+    // element's port set, so the outer map node re-runs that element.)
+    if wrote {
+        gref.mark_dirty(map.id());
+    }
+
+    wrote
+}
+
+/// Runs one inner-level fan-out pass over a single element of an outer map:
+/// clones the element, runs [`run_map_fanout`] against the element's shared
+/// element-port set and nested store, and writes the element back. Returns
+/// true if the element was written back.
+fn process_nested_element<S, A, E, B, L, F>(
+    gref: &mut DagStructRef<S>,
+    gpu: Option<&sm::Gpu>,
+    outer: Port<HashMap<A, E>, S>,
+    a: &A,
+    inner: Port<HashMap<B, L>, E>,
+    elem_in_ids: &[PortId],
+    fresh: bool,
+    eval: &mut F,
+) -> bool
+where
+    A: Clone + Eq + std::hash::Hash + 'static,
+    E: Clone + 'static,
+    B: Clone + Eq + std::hash::Hash + 'static,
+    L: Clone + 'static,
+    F: FnMut(&mut DagStructRef<E>, Option<&sm::Gpu>, &B, &mut DagStructRef<L>),
+{
+    let mut e2 = outer.read(gref).get(a).cloned().unwrap();
+    let wrote = {
+        let ports_rc = gref.ensure_elem_ports::<A>(outer.id(), a.clone());
+        let nested = gref.ensure_elem_nested::<A>(outer.id(), a.clone());
+        let fired = Rc::new(RefCell::new(HashSet::new()));
+        let mut eref = DagStructRef::new_with(&mut e2, ports_rc, fired, nested);
+        run_map_fanout(&mut eref, gpu, inner, elem_in_ids, fresh, eval)
+    };
+    if wrote {
+        outer.read_mut_state(gref.inner_mut()).insert(a.clone(), e2);
+        true
+    } else {
+        false
     }
 }
