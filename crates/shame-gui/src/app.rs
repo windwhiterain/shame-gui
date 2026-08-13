@@ -24,14 +24,14 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::window::Window;
 
 use crate::buffer_pool::BufferPool;
-use crate::canvas::{Canvas, RenderSlot};
+use crate::canvas::{BatchedGroupSlot, Canvas, RenderSlot};
 use crate::gpu;
 use crate::graph::write_source_fields;
 use crate::graph::{AppState, BuiltinState, DagStructRef, Graph, Port};
 use crate::gui::Gui;
 use crate::gui::event::InputEvent;
 use crate::instance::GpuStruct;
-use crate::material::{GpuBufferSlot, InstanceBuffer, Material};
+use crate::material::{GpuBufferSlot, InstanceArena, InstanceBuffer, Material};
 use crate::math::{Vec2, Vec2u};
 use crate::shader::{RectInstance, RectMaterial, ViewportParams, WireframeMaterial};
 use crate::text::TextSystem;
@@ -65,6 +65,7 @@ pub struct App<S: AppState = BuiltinState> {
     state: S,
     graph: Graph<S>,
     pending_render_slots: Vec<RenderSlot<S>>,
+    pending_batched_groups: Vec<BatchedGroupSlot<S>>,
     gpu_buffer_pool: Rc<RefCell<BufferPool<wgpu::Buffer>>>,
     /// Events emitted by the runner's `after_tick` hook, injected at the
     /// start of the next `step()` call.
@@ -91,6 +92,7 @@ impl<S: AppState> App<S> {
             state: S::default(),
             graph: Graph::new(),
             pending_render_slots: Vec::new(),
+            pending_batched_groups: Vec::new(),
             gpu_buffer_pool: Rc::new(RefCell::new(BufferPool::new())),
             pending_events: Vec::new(),
         }
@@ -236,6 +238,80 @@ impl<S: AppState> App<S> {
         self
     }
 
+    /// Registers multiple render objects that share one material and one push
+    /// constant, batched into a single indirect dispatch.
+    ///
+    /// Unlike [`Self::register_render_object`] — which gives every object its
+    /// own GPU buffer, bind group, and draw call — this writes all objects'
+    /// instances into one shared [`InstanceArena`] and issues one
+    /// `multi_draw_indexed_indirect` per call. Each object keeps its own
+    /// [`InstanceBuffer`](crate::material::InstanceBuffer) port and its own
+    /// upload node, so only the objects that changed are re-uploaded; no
+    /// CPU-side concatenation happens.
+    ///
+    /// - `material` — a `Port<M, S>` holding the material (shared pipeline).
+    /// - `constant` — a `Port<M::PushConstant, S>` holding the shared push
+    ///   constant (must be identical across the whole batch; a single indirect
+    ///   dispatch has a single push constant).
+    /// - `cpu_buffers` — one `Port<InstanceBuffer<M::Instance>, S>` per object.
+    pub fn register_render_objects_batched<M: Material>(
+        &mut self,
+        material: Port<M, S>,
+        constant: Port<M::PushConstant, S>,
+        cpu_buffers: impl IntoIterator<Item = Port<InstanceBuffer<M::Instance>, S>>,
+    ) -> &mut Self
+    where
+        M::PushConstant: crate::graph::PortValue,
+    {
+        let wire_size = <M::Instance as GpuStruct>::wire_size();
+        let arena = Rc::new(RefCell::new(InstanceArena::new(wire_size)));
+
+        for cpu_p in cpu_buffers {
+            let slot = arena.borrow_mut().add_slot();
+            let arena2 = arena.clone();
+            let mat_p = material;
+            self.graph.add_node(
+                move |gref: &mut DagStructRef<S>, gpu: Option<&sm::Gpu>| {
+                    let Some(gpu) = gpu else { return };
+                    let cpu: &InstanceBuffer<M::Instance> = cpu_p.read(gref);
+                    let (is_empty, bytes, count) = (
+                        cpu.is_empty(),
+                        cpu.as_bytes().to_vec(),
+                        cpu.instance_count(),
+                    );
+                    let mut arena = arena2.borrow_mut();
+                    if is_empty {
+                        arena.free_slot(slot);
+                        return;
+                    }
+                    let bytes_len = bytes.len().max(1) as u32;
+                    let offset = arena.alloc_for_slot(slot, count, bytes_len);
+                    // Grow the arena buffer *before* writing, so `upload` never
+                    // targets an offset past the current buffer's end.
+                    let needed = arena.committed_size();
+                    arena.ensure_capacity(gpu, needed);
+                    arena.upload(gpu, offset, if bytes.is_empty() { &[0u8] } else { &bytes });
+                },
+                (cpu_p, mat_p),
+                (),
+                None,
+            );
+        }
+
+        let has_fb = M::HAS_FB_PUSH_CONSTANT;
+        self.pending_batched_groups.push(BatchedGroupSlot {
+            arena,
+            has_fb_in_push_constant: has_fb,
+            material_slot: None,
+            register_material: Some(Box::new(move |canvas: &mut Canvas<S>, gpu| {
+                canvas.register_material(gpu, M::default()).index
+            })),
+            read_push_constant: push_bytes::<M::PushConstant, S>(constant),
+        });
+
+        self
+    }
+
     /// Sets the clear color of the window background (wgpu linear-space RGBA).
     #[must_use]
     pub fn with_clear_color(mut self, color: wgpu::Color) -> Self {
@@ -355,6 +431,7 @@ impl<S: AppState> App<S> {
             state,
             graph,
             pending_render_slots,
+            pending_batched_groups,
             gpu_buffer_pool: _,
             pending_events: _,
         } = self;
@@ -375,6 +452,7 @@ impl<S: AppState> App<S> {
             mouse_down: false,
             scroll_delta: 0.0,
             pending_render_slots,
+            pending_batched_groups,
         };
         event_loop.run_app(&mut app).unwrap();
     }
@@ -396,6 +474,7 @@ struct FrameApp<S: AppState> {
     mouse_down: bool,
     scroll_delta: f32,
     pending_render_slots: Vec<RenderSlot<S>>,
+    pending_batched_groups: Vec<BatchedGroupSlot<S>>,
     runner: Option<Box<dyn crate::capture::AppRunner<S>>>,
 }
 
@@ -645,6 +724,9 @@ impl<S: AppState> ApplicationHandler for FrameApp<S> {
         canvas.resize(size.width.max(1), size.height.max(1));
         for pending in self.pending_render_slots.drain(..) {
             canvas.add_render_slot(pending);
+        }
+        for pending in self.pending_batched_groups.drain(..) {
+            canvas.add_batched_group(pending);
         }
         self.window = Some(window);
         self.gpu_setup = Some(gpu_setup);

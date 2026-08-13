@@ -9,6 +9,7 @@
 use std::any::{Any, TypeId};
 use std::hash::Hash;
 use std::marker::PhantomData;
+use std::num::NonZero;
 
 use shame_wgpu as sm;
 
@@ -180,6 +181,288 @@ impl<I: GpuStruct> Default for InstanceBuffer<I> {
 pub struct GpuBufferSlot {
     pub buffer: wgpu::Buffer,
     pub instance_count: u32,
+}
+
+/// One render object's slice inside a shared [`InstanceArena`].
+#[derive(Debug, Clone, Copy)]
+struct ArenaSlice {
+    /// Byte offset of this object's instances within the arena buffer.
+    offset: u32,
+    /// Byte size of the slice (`instance_count * wire_size`).
+    byte_size: u32,
+    /// Number of instances stored in this slice.
+    instance_count: u32,
+}
+
+/// A shared, grow-only GPU buffer that holds instances from many render
+/// objects of the same material, plus the indirect-draw arguments buffer that
+/// turns them into a single `multi_draw_indexed_indirect` dispatch.
+///
+/// Instances are uploaded by DAG nodes ([`App::register_render_object_batched`](crate::app::App::register_render_object_batched))
+/// into per-object slices; the [`Canvas`](crate::canvas::Canvas) builds the
+/// args buffer and issues one indirect dispatch per arena. A CPU byte mirror
+/// is kept so that a grow (buffer recreation) can re-upload every slice without
+/// re-serializing instances — only the changed slice's bytes are ever written.
+pub struct InstanceArena {
+    /// Shared storage buffer (STORAGE | COPY_DST). Created lazily on the
+    /// first non-empty upload; recreated (grow-only) when slices no longer fit.
+    buffer: Option<wgpu::Buffer>,
+    /// CPU mirror of the buffer contents (for grow re-upload).
+    cpu_mirror: Vec<u8>,
+    /// Bind group over `buffer`; rebuilt when the buffer is recreated.
+    bind_group: Option<wgpu::BindGroup>,
+    /// Wire byte size of one instance (for byte-offset → `first_instance`).
+    wire_size: usize,
+    /// Per-object slices, indexed by the object's slot id (stable across
+    /// frames, assigned at registration time).
+    slots: Vec<Option<ArenaSlice>>,
+    /// Free byte ranges available for reuse (first-fit).
+    free_list: Vec<FreeBlock>,
+    /// Append cursor used when no free block fits.
+    next_offset: u32,
+    /// Indirect args buffer (INDIRECT | COPY_DST); grown as needed.
+    args_buffer: Option<wgpu::Buffer>,
+}
+
+/// A free byte range in the arena's free-list.
+#[derive(Debug, Clone, Copy)]
+struct FreeBlock {
+    offset: u32,
+    size: u32,
+}
+
+impl InstanceArena {
+    pub(crate) fn new(wire_size: usize) -> Self {
+        Self {
+            buffer: None,
+            cpu_mirror: Vec::new(),
+            bind_group: None,
+            wire_size,
+            slots: Vec::new(),
+            free_list: Vec::new(),
+            next_offset: 0,
+            args_buffer: None,
+        }
+    }
+
+    /// Registers a new object slot and returns its stable id.
+    pub(crate) fn add_slot(&mut self) -> usize {
+        self.slots.push(None);
+        self.slots.len() - 1
+    }
+
+    /// Total bytes committed so far (the arena buffer must be at least this
+    /// large to hold every allocated slice).
+    pub(crate) fn committed_size(&self) -> u64 {
+        self.next_offset as u64
+    }
+
+    /// Clears a slot's slice (the object became empty).
+    pub(crate) fn free_slot(&mut self, slot: usize) {
+        if let Some(old) = self.slots[slot].take() {
+            self.free(old.offset, old.byte_size);
+        }
+    }
+
+    /// Returns a slice's byte range to the free-list.
+    fn free(&mut self, offset: u32, size: u32) {
+        if size == 0 {
+            return;
+        }
+        self.free_list.push(FreeBlock { offset, size });
+    }
+
+    /// Allocates a slice of `bytes` (a multiple of wire size) and returns its
+    /// byte offset. The caller writes the instance data at that offset.
+    fn alloc(&mut self, bytes: u32) -> u32 {
+        debug_assert!(bytes > 0, "alloc(0) is invalid; guard empty slices first");
+        if let Some(idx) = self.free_list.iter().position(|b| b.size >= bytes) {
+            let block = self.free_list.remove(idx);
+            let rem = block.size - bytes;
+            if rem > 0 {
+                self.free_list.push(FreeBlock {
+                    offset: block.offset + bytes,
+                    size: rem,
+                });
+            }
+            return block.offset;
+        }
+        let offset = self.next_offset;
+        self.next_offset += bytes;
+        offset
+    }
+
+    /// Replaces a slot's slice: frees the old one, allocates a fresh slice for
+    /// `bytes`, and records it. Returns the new byte offset.
+    pub(crate) fn alloc_for_slot(&mut self, slot: usize, instance_count: u32, bytes: u32) -> u32 {
+        self.free_slot(slot);
+        let offset = self.alloc(bytes);
+        let byte_size = instance_count as usize * self.wire_size;
+        self.slots[slot] = Some(ArenaSlice {
+            offset,
+            byte_size: byte_size as u32,
+            instance_count,
+        });
+        offset
+    }
+
+    /// Ensures the storage buffer has at least `needed` bytes, recreating it
+    /// (grow-only) when necessary and re-uploading the CPU mirror.
+    pub(crate) fn ensure_capacity(&mut self, gpu: &sm::Gpu, needed: u64) {
+        if self.buffer.as_ref().is_none_or(|b| b.size() < needed) {
+            let size = needed.max(1);
+            self.buffer = Some(gpu.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("instance arena"),
+                size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            self.cpu_mirror.resize(size as usize, 0);
+            gpu.queue()
+                .write_buffer(self.buffer.as_ref().unwrap(), 0, &self.cpu_mirror);
+            self.bind_group = None; // buffer changed → rebuild bind group
+        }
+    }
+
+    /// Writes `bytes` for a slice into both the CPU mirror and the GPU buffer
+    /// at `offset`.
+    pub(crate) fn upload(&mut self, gpu: &sm::Gpu, offset: u32, bytes: &[u8]) {
+        if let Some(buffer) = self.buffer.as_ref() {
+            gpu.queue().write_buffer(buffer, offset as u64, bytes);
+        }
+        let start = offset as usize;
+        let end = start + bytes.len();
+        if self.cpu_mirror.len() < end {
+            self.cpu_mirror.resize(end, 0);
+        }
+        self.cpu_mirror[start..end].copy_from_slice(bytes);
+    }
+
+    /// The storage buffer, if it has been created.
+    #[allow(dead_code)]
+    pub(crate) fn buffer(&self) -> Option<&wgpu::Buffer> {
+        self.buffer.as_ref()
+    }
+
+    /// Builds (or returns the cached) bind group over the arena buffer using
+    /// the material's cached bindings.
+    pub(crate) fn ensure_bind_group(
+        &mut self,
+        gpu: &sm::Gpu,
+        bindings: &MaterialBindings,
+    ) -> Option<&wgpu::BindGroup> {
+        if self.bind_group.is_some() {
+            return self.bind_group.as_ref();
+        }
+        let buffer = self.buffer.as_ref()?;
+        let binding = wgpu::BufferBinding {
+            buffer,
+            offset: 0,
+            size: Some(NonZero::new(buffer.size()).unwrap()),
+        };
+        let bind_group = (bindings.make_bind_group)(gpu, &bindings.layout, &binding);
+        self.bind_group = Some(bind_group);
+        self.bind_group.as_ref()
+    }
+
+    /// The cached bind group.
+    pub(crate) fn bind_group(&self) -> Option<&wgpu::BindGroup> {
+        self.bind_group.as_ref()
+    }
+
+    /// Builds the indirect draw args for the current slices, one per live
+    /// slice. `index_count` is the material's index buffer length.
+    pub(crate) fn args(&self, index_count: u32) -> Vec<wgpu::util::DrawIndexedIndirectArgs> {
+        let wire_size = self.wire_size.max(1) as u32;
+        self.slots
+            .iter()
+            .filter_map(|s| {
+                s.map(|s| wgpu::util::DrawIndexedIndirectArgs {
+                    index_count,
+                    instance_count: s.instance_count,
+                    first_index: 0,
+                    base_vertex: 0,
+                    first_instance: s.offset / wire_size,
+                })
+            })
+            .collect()
+    }
+
+    /// Uploads the args buffer (recreating it if too small) and returns it.
+    pub(crate) fn write_args(
+        &mut self,
+        gpu: &sm::Gpu,
+        args: &[wgpu::util::DrawIndexedIndirectArgs],
+    ) -> Option<&wgpu::Buffer> {
+        if args.is_empty() {
+            return None;
+        }
+        let bytes: Vec<u8> = args.iter().flat_map(|a| a.as_bytes().to_vec()).collect();
+        if self
+            .args_buffer
+            .as_ref()
+            .is_none_or(|b| b.size() < bytes.len() as u64)
+        {
+            self.args_buffer = Some(gpu.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("instance arena args"),
+                size: bytes.len().max(1) as u64,
+                usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        gpu.queue()
+            .write_buffer(self.args_buffer.as_ref().unwrap(), 0, &bytes);
+        self.args_buffer.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arena_alloc_and_args() {
+        // wire_size = 16 (e.g. a 16-byte instance struct).
+        let mut arena = InstanceArena::new(16);
+        let s0 = arena.add_slot();
+        let s1 = arena.add_slot();
+
+        // s0: 3 instances (48 bytes) at offset 0.
+        let off0 = arena.alloc_for_slot(s0, 3, 48);
+        assert_eq!(off0, 0);
+        // s1: 1 instance (16 bytes) at offset 48.
+        let off1 = arena.alloc_for_slot(s1, 1, 16);
+        assert_eq!(off1, 48);
+        assert_eq!(arena.committed_size(), 64);
+
+        let args = arena.args(6);
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0].first_instance, 0);
+        assert_eq!(args[0].instance_count, 3);
+        assert_eq!(args[1].first_instance, 3); // 48 bytes / 16
+        assert_eq!(args[1].instance_count, 1);
+    }
+
+    #[test]
+    fn arena_free_reuses_space() {
+        let mut arena = InstanceArena::new(16);
+        let s0 = arena.add_slot();
+        let s1 = arena.add_slot();
+
+        arena.alloc_for_slot(s0, 4, 64); // 64 bytes
+        arena.alloc_for_slot(s1, 2, 32); // 32 bytes, offset 64
+        assert_eq!(arena.committed_size(), 96);
+
+        // Freeing s0 puts a 64-byte block back; a new 32-byte alloc reuses it.
+        arena.free_slot(s0);
+        let s2 = arena.add_slot();
+        let off2 = arena.alloc_for_slot(s2, 2, 32);
+        assert_eq!(off2, 0);
+        assert_eq!(arena.committed_size(), 96); // no growth
+
+        let args = arena.args(6);
+        assert_eq!(args.len(), 2); // s0 is gone; s1 + s2 remain
+    }
 }
 
 /// Type-erased, hashable registry key for one material value.

@@ -20,7 +20,7 @@ mod graph;
 
 pub use element::DagStructRef;
 pub use graph::Graph;
-pub use port::{DagStruct, Port, PortGroup, PortId, PortValue};
+pub use port::{DagStruct, MapEntry, Port, PortGroup, PortId, PortValue};
 pub use state::{
     AppState, BuiltinState, RENDER_PORT_BASE, RenderPorts, SOURCE_PORT_BASE, SourcePorts,
     write_source_fields,

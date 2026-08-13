@@ -27,6 +27,10 @@ struct NodeEntry<S> {
     /// event-driven: it runs only when this port's value is `true`, and the
     /// dirty mechanism on `source_input_ids` is completely bypassed.
     condition: Option<Port<bool, S>>,
+    /// For map nodes: the id of the map port this node reads/writes. Used to
+    /// break map↔map cycles (two map nodes over the same map) during topo
+    /// sort, so chained map stages can coexist without a cycle.
+    map_port: Option<PortId>,
 }
 
 /// An edge from a source port to a downstream node.
@@ -60,6 +64,10 @@ pub struct Graph<S: DagStruct> {
     /// Maps condition ports to the node indices that are triggered when the
     /// port value is `true`.
     pub condition_map: HashMap<PortId, Vec<usize>>,
+    /// Per-port map-level dirty records (key ops / full flag), shared with
+    /// [`DagStructRef`] and consumed by `add_map_node` for incremental
+    /// reprocessing. Stored type-erased per map key type.
+    map_dirty: Rc<RefCell<HashMap<PortId, Box<dyn std::any::Any>>>>,
 }
 
 impl<S: DagStruct> Graph<S> {
@@ -75,6 +83,7 @@ impl<S: DagStruct> Graph<S> {
             fired: Rc::new(RefCell::new(HashSet::new())),
             condition_ports: HashMap::new(),
             condition_map: HashMap::new(),
+            map_dirty: Rc::new(RefCell::new(HashMap::new())),
         }
     }
 
@@ -89,13 +98,20 @@ impl<S: DagStruct> Graph<S> {
         // in_degree[dest] = number of (producer, port) pairs where the
         // producer (other than `dest`) outputs a port that `dest` reads.
         // A node reading its own output (in-place update) does not depend
-        // on itself, so self-edges contribute nothing.
+        // on itself, so self-edges contribute nothing. Two map nodes over the
+        // same map also do not depend on each other (they are chained
+        // pipeline stages ordered by insertion), so those edges are skipped
+        // too — this removes the map↔map cycle while keeping edges from map
+        // nodes to non-map readers intact.
         let mut in_degree = vec![0u32; n];
         for p in 0..n {
             for port in self.nodes[p].output_ids.clone() {
                 if let Some(edges) = self.edges.get(&port) {
                     for e in edges {
-                        if e.dest_node != p {
+                        if e.dest_node != p
+                            && !(self.nodes[p].map_port == Some(port)
+                                && self.nodes[e.dest_node].map_port == Some(port))
+                        {
                             in_degree[e.dest_node] += 1;
                         }
                     }
@@ -110,7 +126,10 @@ impl<S: DagStruct> Graph<S> {
             for port in self.nodes[p].output_ids.clone() {
                 if let Some(edges) = self.edges.get(&port) {
                     for e in edges {
-                        if e.dest_node != p {
+                        if e.dest_node != p
+                            && !(self.nodes[p].map_port == Some(port)
+                                && self.nodes[e.dest_node].map_port == Some(port))
+                        {
                             in_degree[e.dest_node] -= 1;
                             if in_degree[e.dest_node] == 0 {
                                 queue.push_back(e.dest_node);
@@ -133,7 +152,12 @@ impl<S: DagStruct> Graph<S> {
     /// this graph's dirty/fired sets. Used by the framework to write source
     /// fields (marking them dirty) and by the GUI render walk.
     pub fn with_state<'a>(&'a self, state: &'a mut S) -> DagStructRef<'a, S> {
-        DagStructRef::new_with(state, self.dirty.clone(), self.fired.clone())
+        DagStructRef::new_with(
+            state,
+            self.dirty.clone(),
+            self.fired.clone(),
+            self.map_dirty.clone(),
+        )
     }
 
     /// Registers a compute node.
@@ -174,6 +198,7 @@ impl<S: DagStruct> Graph<S> {
             output_ids,
             source_input_ids: input_ids,
             condition,
+            map_port: None,
         });
         self.pending_first_run.insert(index);
         self.topo_stale = true;
@@ -181,22 +206,25 @@ impl<S: DagStruct> Graph<S> {
 
     /// Registers a per-element fan-out node over a `HashMap<K, E>`.
     ///
-    /// The node reads `map` (mutated in place by upstream nodes or widgets)
-    /// and, for each *changed* key, clones the element, wraps it in a
-    /// `DagStructRef<E>`, and runs `eval` against it together with the
-    /// global state. Changed elements are written back into the map.
+    /// The node reads `map` and, for each element that needs reprocessing,
+    /// clones it, wraps it in a `DagStructRef<E>` whose **element-port dirty
+    /// set is shared with the graph**, and runs `eval` against it together
+    /// with the global state. The result is written back into the map.
     ///
     /// - `global_in` — global (`S`) ports the eval reads. A dirty global
     ///   input triggers a **full refresh** (every key reprocessed).
     /// - `global_out` — global (`S`) ports the eval writes (topology).
-    /// - `elem_in` / `elem_out` — element (`E`) ports the eval reads/writes
-    ///   (accepted for the explicit global/element distinction at the call
-    ///   site; the per-key diff drives reprocessing).
+    /// - `elem_in` / `elem_out` — element (`E`) ports the eval reads/writes.
+    ///   An element is reprocessed when any of its `elem_in` ports was marked
+    ///   dirty (by a prior map stage's `elem_out` write, or a whole-element
+    ///   `MapEntry::read_mut`); writing an `elem_out` port marks it dirty for
+    ///   downstream map stages.
     /// - `eval` — `FnMut(&mut DagStructRef<S>, Option<&Gpu>, &K, &mut DagStructRef<E>)`.
     ///
-    /// Per-key dirty tracking lives entirely inside this node: it diffs the
-    /// map against its private previous snapshot, so only changed keys are
-    /// reprocessed and only changed entries are (re)allocated in the map.
+    /// Dirty is **write-based**, mirroring the global graph: a whole-map
+    /// `Port::write`/`read_mut` reprocesses every element; `Port::insert`/
+    /// `remove` and `MapEntry::read_mut` affect only the relevant key; and
+    /// per-element-port writes propagate through chained map stages.
     pub fn add_map_node<K, E, F>(
         &mut self,
         map: Port<HashMap<K, E>, S>,
@@ -207,68 +235,117 @@ impl<S: DagStruct> Graph<S> {
         eval: F,
     ) where
         K: Clone + Eq + std::hash::Hash + 'static,
-        E: Clone + PartialEq + 'static,
+        E: Clone + 'static,
         F: FnMut(&mut DagStructRef<S>, Option<&sm::Gpu>, &K, &mut DagStructRef<E>) + 'static,
     {
-        let _ = (elem_in.leaf_count(), elem_out.leaf_count());
-
+        let map_id = map.id();
         let global_in_ids = global_in.ids();
+        let elem_in_ids = elem_in.ids();
         let map_in = map;
         let map_out = map;
-        let mut prev: HashMap<K, E> = HashMap::new();
+        let mut known_keys: HashSet<K> = HashSet::new();
         let mut eval = eval;
 
         self.add_node(
             move |gref: &mut DagStructRef<S>, gpu: Option<&sm::Gpu>| {
-                let full_refresh = global_in_ids.iter().any(|id| gref.is_dirty(*id));
+                let global_refresh = global_in_ids.iter().any(|id| gref.is_dirty(*id));
 
-                // Phase A: snapshot the elements to process.
-                let (changed, removed): (Vec<(K, E)>, Vec<K>) = {
+                // Snapshot the map's dirty record (consumed conceptually; the
+                // record itself is cleared at end of tick).
+                let md = gref.snapshot_map_dirty::<K>(map_in.id());
+
+                // Phase A: decide which keys to process / remove (borrows the
+                // map, then releases before writing back).
+                let (to_process, to_remove): (Vec<(K, E)>, Vec<K>) = {
                     let cur: &HashMap<K, E> = map_in.read(gref);
-                    let mut changed = Vec::new();
-                    let mut removed = Vec::new();
-                    for (k, v) in cur.iter() {
-                        let is_changed = if full_refresh {
-                            true
-                        } else {
-                            match prev.get(k) {
-                                Some(p) => p != v,
-                                None => true,
+                    let mut to_process = Vec::new();
+                    let mut to_remove = Vec::new();
+
+                    if md.full || global_refresh {
+                        // Whole-map write or global refresh → reprocess every
+                        // current key.
+                        to_process.extend(cur.iter().map(|(k, v)| (k.clone(), v.clone())));
+                    } else {
+                        // Structural diff: new keys → process, removed keys →
+                        // drop.
+                        for k in cur.keys() {
+                            if !known_keys.contains(k) {
+                                to_process.push((k.clone(), cur[k].clone()));
                             }
-                        };
-                        if is_changed {
-                            changed.push((k.clone(), v.clone()));
+                        }
+                        for k in &known_keys {
+                            if !cur.contains_key(k) {
+                                to_remove.push(k.clone());
+                            }
+                        }
+                        // Per-key dirty records: whole-element mutation, or an
+                        // element-port write that overlaps this node's reads.
+                        for (k, ed) in &md.keys {
+                            if !cur.contains_key(k) {
+                                continue;
+                            }
+                            if ed.full {
+                                to_process.push((k.clone(), cur[k].clone()));
+                            } else {
+                                let ports = ed.ports.borrow();
+                                if elem_in_ids.iter().any(|id| ports.contains(id)) {
+                                    to_process.push((k.clone(), cur[k].clone()));
+                                }
+                            }
                         }
                     }
-                    for k in prev.keys() {
-                        if !cur.contains_key(k) {
-                            removed.push(k.clone());
-                        }
-                    }
-                    (changed, removed)
+                    (to_process, to_remove)
                 };
 
-                // Phase B: process changed elements and write them back.
-                for (k, e) in changed {
+                // Phase B: process changed elements, sharing this key's
+                // element-port dirty set with the eval so its writes propagate.
+                let mut wrote = false;
+                for (k, e) in to_process {
+                    let ports_rc = gref.ensure_elem_ports::<K>(map_in.id(), k.clone());
                     let mut e2 = e;
                     {
-                        let mut eref = DagStructRef::new(&mut e2);
+                        // Fired + element map-dirty are isolated (no consumer
+                        // yet); only the element-port dirty set is shared.
+                        let fired = Rc::new(RefCell::new(HashSet::new()));
+                        let emd: Rc<RefCell<HashMap<PortId, Box<dyn std::any::Any>>>> =
+                            Rc::new(RefCell::new(HashMap::new()));
+                        let mut eref = DagStructRef::new_with(&mut e2, ports_rc, fired, emd);
                         eval(&mut *gref, gpu, &k, &mut eref);
                     }
-                    prev.insert(k.clone(), e2.clone());
-                    map_out.read_mut(gref).insert(k, e2);
+                    map_out.read_mut_state(gref.inner_mut()).insert(k, e2);
+                    wrote = true;
                 }
 
                 // Phase C: drop removed keys.
-                for k in removed {
-                    prev.remove(&k);
-                    map_out.read_mut(gref).remove(&k);
+                for k in to_remove {
+                    map_out.read_mut_state(gref.inner_mut()).remove(&k);
+                    wrote = true;
+                }
+
+                // Phase D: refresh the known key set to the current map.
+                known_keys.clear();
+                known_keys.extend(map_in.read_state(gref.inner()).keys().cloned());
+
+                // Propagate the map change to downstream (non-map) readers.
+                // Deliberately avoids `map_out.write`/`read_mut` so the map
+                // node's own write-back does not re-record a full change.
+                if wrote {
+                    gref.mark_dirty(map_out.id());
                 }
             },
             (global_in, map_in),
             (global_out, map_out),
             None,
         );
+
+        // Tag this node as a map node over `map`, so topo sort can break
+        // map↔map cycles between chained stages.
+        self.nodes.last_mut().expect("just added a node").map_port = Some(map_id);
+
+        // `elem_out` is consumed only for its type/group at the call site; the
+        // actual per-element-port dirty propagation happens through the shared
+        // element-port set inside the eval.
+        let _ = elem_out;
     }
 
     /// Per-frame execution. Runs nodes whose input ports are dirty, in
@@ -281,6 +358,7 @@ impl<S: DagStruct> Graph<S> {
         if self.nodes.is_empty() {
             self.dirty.borrow_mut().clear();
             self.fired.borrow_mut().clear();
+            self.map_dirty.borrow_mut().clear();
             return;
         }
 
@@ -292,7 +370,8 @@ impl<S: DagStruct> Graph<S> {
         {
             let dirty = self.dirty.clone();
             let fired = self.fired.clone();
-            let mut dagref = DagStructRef::new_with(state, dirty, fired);
+            let map_dirty = self.map_dirty.clone();
+            let mut dagref = DagStructRef::new_with(state, dirty, fired, map_dirty);
 
             for &idx in self.topo_order.iter() {
                 let is_new = self.pending_first_run.remove(&idx);
@@ -325,5 +404,6 @@ impl<S: DagStruct> Graph<S> {
         }
 
         self.dirty.borrow_mut().clear();
+        self.map_dirty.borrow_mut().clear();
     }
 }

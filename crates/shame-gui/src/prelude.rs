@@ -8,8 +8,8 @@ pub use crate::app::App;
 pub use crate::capture::{AppContext, AppRunner, FrameOutput, read_frame_rgba};
 pub use crate::color::Color;
 pub use crate::graph::{
-    AppState, BuiltinState, DagStruct, DagStructRef, Graph, Port, PortGroup, PortId, PortValue,
-    RenderPorts, SourcePorts,
+    AppState, BuiltinState, DagStruct, DagStructRef, Graph, MapEntry, Port, PortGroup, PortId,
+    PortValue, RenderPorts, SourcePorts,
 };
 pub use crate::gui::{
     AnyWidget, EventResponse, Gui, InputEvent, Key, MouseButton, RenderContext, SplitDir,

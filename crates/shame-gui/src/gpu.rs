@@ -32,7 +32,7 @@ impl Setup {
         .unwrap();
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: None,
-            required_features: wgpu::Features::IMMEDIATES,
+            required_features: wgpu::Features::IMMEDIATES | wgpu::Features::INDIRECT_FIRST_INSTANCE,
             required_limits: wgpu::Limits {
                 max_immediate_size: 256,
                 ..wgpu::Limits::default().using_resolution(adapter.limits())

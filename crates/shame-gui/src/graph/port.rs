@@ -3,10 +3,14 @@
 //! element are the same kind of thing — a `#[derive(DagStruct)]` struct —
 //! so the same `Port` works for both.
 
+use std::any::Any;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::graph::element::DagStructRef;
+use crate::graph::element::{DagStructRef, ElemDirty, MapDirty};
 use crate::graph::state::BuiltinState;
 use crate::material::GpuBufferSlot;
 
@@ -17,7 +21,14 @@ use crate::material::GpuBufferSlot;
 /// outputs), for `HashMap<K, V>`, and automatically for any struct deriving
 /// [`DagStruct`](crate::DagStruct) (e.g. `Vec2`, `Rect`, or user state
 /// structs).
-pub trait PortValue: Clone + Default + 'static {}
+pub trait PortValue: Clone + Default + 'static {
+    /// Hook invoked by [`Port::write`] / [`Port::read_mut`] when the whole
+    /// port value is replaced or mutated in place. `HashMap` values override
+    /// this to flag a full reprocess (so any per-key ops recorded in the same
+    /// tick don't hide the rest of the map changing). All other types no-op.
+    #[doc(hidden)]
+    fn note_full_write<S>(_r: &mut DagStructRef<S>, _id: PortId) {}
+}
 impl PortValue for f32 {}
 impl PortValue for u32 {}
 impl PortValue for i32 {}
@@ -34,6 +45,9 @@ impl PortValue for Option<Arc<wgpu::BindGroup>> {}
 impl<K: Clone + Eq + std::hash::Hash + 'static, V: Clone + 'static> PortValue
     for std::collections::HashMap<K, V>
 {
+    fn note_full_write<S>(r: &mut DagStructRef<S>, id: PortId) {
+        r.mark_map_full::<K>(id);
+    }
 }
 
 impl<I: crate::instance::GpuStruct + 'static> PortValue for crate::material::InstanceBuffer<I> {}
@@ -111,6 +125,7 @@ impl<D: PortValue, S> Port<D, S> {
     /// Write a value through a guarded state reference. Marks the port dirty
     /// in the graph.
     pub fn write(&self, r: &mut DagStructRef<'_, S>, value: D) {
+        D::note_full_write(r, self.id);
         (self.write)(r.inner_mut(), value);
         r.mark_dirty(self.id);
     }
@@ -118,6 +133,7 @@ impl<D: PortValue, S> Port<D, S> {
     /// Borrow the value mutably through a guarded state reference. Marks the
     /// port dirty in the graph.
     pub fn read_mut<'r>(&self, r: &'r mut DagStructRef<'_, S>) -> &'r mut D {
+        D::note_full_write(r, self.id);
         r.mark_dirty(self.id);
         (self.read_mut)(r.inner_mut())
     }
@@ -148,6 +164,102 @@ impl<S> Port<bool, S> {
     pub fn fire(&self, r: &mut DagStructRef<'_, S>) {
         (self.write)(r.inner_mut(), true);
         r.mark_fired(self.id);
+    }
+}
+
+/// A guarded handle to a single value inside a `Port<HashMap<K, V>, S>`.
+///
+/// Obtained via [`Port::get`](crate::graph::Port::get); writes through it are
+/// tracked **per key**, so `add_map_node` reprocesses only the affected
+/// element rather than the whole map.
+pub struct MapEntry<'a, K, V, S>
+where
+    K: Clone + Eq + std::hash::Hash + 'static,
+    V: Clone + 'static,
+{
+    port: Port<HashMap<K, V>, S>,
+    key: K,
+    value: &'a mut V,
+    dirty_set: Rc<RefCell<HashSet<PortId>>>,
+    map_dirty: Rc<RefCell<HashMap<PortId, Box<dyn Any>>>>,
+    dirty: bool,
+}
+
+impl<K: Clone + Eq + std::hash::Hash + 'static, V: Clone + 'static, S> MapEntry<'_, K, V, S> {
+    /// Reads the element value without marking anything dirty.
+    pub fn read(&self) -> &V {
+        self.value
+    }
+
+    /// Borrows the element value mutably, marking this key dirty so it is
+    /// reprocessed by `add_map_node` on the next tick.
+    pub fn read_mut(&mut self) -> &mut V {
+        self.dirty = true;
+        self.value
+    }
+}
+
+impl<K: Clone + Eq + std::hash::Hash + 'static, V: Clone + 'static, S> Drop
+    for MapEntry<'_, K, V, S>
+{
+    fn drop(&mut self) {
+        // The `&mut V` borrow has ended by now, so it is safe to touch the
+        // map's per-key dirty record (which lives outside the value).
+        if self.dirty {
+            let id = self.port.id();
+            self.dirty_set.borrow_mut().insert(id);
+            let mut map = self.map_dirty.borrow_mut();
+            let entry = map
+                .entry(id)
+                .or_insert_with(|| Box::new(MapDirty::<K>::new()));
+            let record = entry
+                .downcast_mut::<MapDirty<K>>()
+                .expect("map dirty record type mismatch");
+            record
+                .keys
+                .entry(self.key.clone())
+                .or_insert_with(ElemDirty::new)
+                .full = true;
+        }
+    }
+}
+
+impl<K: Clone + Eq + std::hash::Hash + 'static, V: Clone + 'static, S> Port<HashMap<K, V>, S> {
+    /// Returns a guarded handle to the value at `key`, if present.
+    ///
+    /// Unlike [`Port::read_mut`](crate::graph::Port::read_mut), borrowing the
+    /// element through this handle and writing via [`MapEntry::read_mut`] marks
+    /// **only this key** dirty — so `add_map_node` reprocesses just that
+    /// element. Reading via [`MapEntry::read`] marks nothing.
+    pub fn get<'a>(&self, r: &'a mut DagStructRef<'_, S>, key: K) -> Option<MapEntry<'a, K, V, S>> {
+        let map_dirty = r.map_dirty_rc();
+        let dirty_set = r.dirty_rc();
+        let value = self.read_mut_state(r.inner_mut()).get_mut(&key)?;
+        Some(MapEntry {
+            port: *self,
+            key,
+            value,
+            dirty_set,
+            map_dirty,
+            dirty: false,
+        })
+    }
+
+    /// Inserts `value` at `key`. Marks the map port dirty; the map node
+    /// reprocesses only the new key (via the key-set structural diff).
+    pub fn insert(&self, r: &mut DagStructRef<'_, S>, key: K, value: V) {
+        self.read_mut_state(r.inner_mut())
+            .insert(key.clone(), value);
+        r.mark_dirty(self.id);
+    }
+
+    /// Removes `key`, marking the map port dirty so the map node drops it.
+    pub fn remove(&self, r: &mut DagStructRef<'_, S>, key: K) -> Option<V> {
+        let removed = self.read_mut_state(r.inner_mut()).remove(&key);
+        if removed.is_some() {
+            r.mark_dirty(self.id);
+        }
+        removed
     }
 }
 
