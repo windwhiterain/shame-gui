@@ -246,6 +246,22 @@ where
     R::new(ndc_pos, ndc_size)
 }
 
+/// GPU-side convenience: converts a pixel rect given as raw `sm::f32x2`
+/// position/size nodes into NDC. Requires an active shame encoding context
+/// (call inside `Material::build`).
+///
+/// This is the shared entry point for the built-in materials' vertex
+/// shaders; the CPU equivalent is [`rect_to_ndc`].
+pub fn pixel_rect_to_ndc_gpu(
+    pos: sm::f32x2,
+    size: sm::f32x2,
+    fb: sm::f32x2,
+) -> (sm::f32x2, sm::f32x2) {
+    let rect = crate::rect::RectGpu { pos, size };
+    let ndc = rect_to_ndc::<crate::rect::RectGpu, true>(rect, fb);
+    (ndc.pos, ndc.size)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

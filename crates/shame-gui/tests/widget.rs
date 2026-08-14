@@ -113,6 +113,44 @@ fn number_escape_cancels_editing() {
 }
 
 #[test]
+fn number_arrow_keys_step_over_multibyte_chars() {
+    // Non-ASCII input is accepted by the Char guard; cursor movement and
+    // backspace must operate on whole characters, not bytes (byte offsets
+    // inside a multi-byte char would panic on insert/remove).
+    let mut w = W::default();
+    let port = make_port(&mut w, 0);
+    let mut nd = NumberWidgetData::default();
+    let rect = field_rect();
+    let mut r = DagStructRef::new(&mut w);
+    port.on_event(&mut r, &mut nd, &click_inside(), rect);
+    nd.buffer.clear();
+    nd.cursor = 0;
+    for ch in ['中', '文'] {
+        port.on_event(&mut r, &mut nd, &InputEvent::Char { ch }, rect);
+    }
+    assert_eq!(nd.cursor, "中文".len());
+    port.on_event(
+        &mut r,
+        &mut nd,
+        &InputEvent::KeyDown {
+            key: Key::ArrowLeft,
+        },
+        rect,
+    );
+    assert_eq!(nd.cursor, "中".len(), "cursor must land on a char boundary");
+    port.on_event(
+        &mut r,
+        &mut nd,
+        &InputEvent::KeyDown {
+            key: Key::Backspace,
+        },
+        rect,
+    );
+    assert_eq!(nd.buffer, "文", "backspace removes one whole character");
+    assert_eq!(nd.cursor, 0);
+}
+
+#[test]
 fn number_selectable_is_true() {
     let mut w = W::default();
     let port = make_port(&mut w, 0);
@@ -149,6 +187,68 @@ fn string_enter_commits_value() {
     );
     assert_eq!(port.read(&r).as_str(), "new");
     assert!(!sd.editing);
+}
+
+#[test]
+fn string_cursor_moves_over_multibyte_chars() {
+    // Regression: cursor movement and backspace used byte arithmetic, so a
+    // multi-byte char (中文) left the cursor mid-char and the next insert /
+    // remove panicked. Movement must step over whole characters.
+    let mut w = Ws { s: String::new() };
+    let port = Ws::ports().s;
+    let mut sd = StringWidgetData::default();
+    let rect = field_rect();
+    let mut r = DagStructRef::new(&mut w);
+    port.on_event(&mut r, &mut sd, &click_inside(), rect);
+    sd.buffer.clear();
+    sd.cursor = 0;
+    for ch in ['中', '文', 'a'] {
+        port.on_event(&mut r, &mut sd, &InputEvent::Char { ch }, rect);
+    }
+    assert_eq!(sd.cursor, "中文a".len());
+    port.on_event(
+        &mut r,
+        &mut sd,
+        &InputEvent::KeyDown {
+            key: Key::ArrowLeft,
+        },
+        rect,
+    );
+    port.on_event(
+        &mut r,
+        &mut sd,
+        &InputEvent::KeyDown {
+            key: Key::ArrowLeft,
+        },
+        rect,
+    );
+    assert_eq!(sd.cursor, "中".len(), "cursor must land on a char boundary");
+    port.on_event(
+        &mut r,
+        &mut sd,
+        &InputEvent::KeyDown {
+            key: Key::Backspace,
+        },
+        rect,
+    );
+    assert_eq!(sd.buffer, "文a", "backspace removes one whole character");
+    assert_eq!(sd.cursor, 0);
+    port.on_event(
+        &mut r,
+        &mut sd,
+        &InputEvent::KeyDown {
+            key: Key::ArrowRight,
+        },
+        rect,
+    );
+    assert_eq!(sd.cursor, "文".len());
+    port.on_event(
+        &mut r,
+        &mut sd,
+        &InputEvent::KeyDown { key: Key::Enter },
+        rect,
+    );
+    assert_eq!(port.read(&r).as_str(), "文a");
 }
 
 // ── Container node: renders children with labels ──────────────────────────

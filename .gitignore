@@ -7,3 +7,4 @@ __pycache__/
 /crates/shame-gui/tests/snapshots/*/diff.png
 .reasonix
 .zcode
+/.compose

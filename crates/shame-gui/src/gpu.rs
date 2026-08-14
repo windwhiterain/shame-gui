@@ -6,6 +6,12 @@ use winit::window::Window;
 
 use shame_wgpu as sm;
 
+/// Maximum push-constant (immediate) size in bytes — wgpu's guaranteed
+/// minimum for `max_immediate_size`, and the limit requested in
+/// [`Setup::new`]. [`Canvas`](crate::canvas::Canvas) panics when a material's
+/// push constant exceeds this.
+pub(crate) const MAX_IMMEDIATE_BYTES: usize = 256;
+
 /// One-time GPU initialization (instance, adapter, device, surface) following
 /// the upstream shame `hello_triangles` pattern. Panics on failure.
 pub struct Setup {
@@ -24,28 +30,37 @@ impl Setup {
     /// Initializes the GPU stack for a window. Panics on failure.
     pub fn new(window: &Arc<Window>) -> Self {
         let instance = wgpu::Instance::default();
-        let surface = instance.create_surface(Arc::clone(window)).unwrap();
+        let surface = instance
+            .create_surface(Arc::clone(window))
+            .expect("failed to create surface for window");
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             compatible_surface: Some(&surface),
             ..Default::default()
         }))
-        .unwrap();
+        .expect("no GPU adapter compatible with this window/surface");
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: None,
+            // IMMEDIATES: shame push constants; INDIRECT_FIRST_INSTANCE:
+            // the batched multi_draw_indexed_indirect path. An adapter that
+            // lacks either fails here.
             required_features: wgpu::Features::IMMEDIATES | wgpu::Features::INDIRECT_FIRST_INSTANCE,
             required_limits: wgpu::Limits {
-                max_immediate_size: 256,
+                // Cap push constants at the wgpu minimum that all adapters
+                // guarantee for maxImmediateSize (see MAX_IMMEDIATE_BYTES).
+                max_immediate_size: MAX_IMMEDIATE_BYTES as u32,
                 ..wgpu::Limits::default().using_resolution(adapter.limits())
             },
             memory_hints: wgpu::MemoryHints::Performance,
             trace: wgpu::Trace::Off,
             experimental_features: Default::default(),
         }))
-        .unwrap();
+        .expect("request_device failed — does the adapter support IMMEDIATES and INDIRECT_FIRST_INSTANCE?");
         device.on_uncaptured_error(Arc::new(|error| {
             eprintln!("wgpu error: {error}");
         }));
-        let mut config = surface.get_default_config(&adapter, 1, 1).unwrap();
+        let mut config = surface
+            .get_default_config(&adapter, 1, 1)
+            .expect("surface format not supported by adapter");
         config.present_mode = wgpu::PresentMode::AutoVsync;
         config.usage |= wgpu::TextureUsages::COPY_SRC;
         let mut setup = Setup {
@@ -90,10 +105,12 @@ impl Setup {
                 }
             }
             attempts += 1;
-            assert!(
-                attempts < 100,
-                "surface acquire failed after {attempts} retries"
-            );
+            if attempts >= 100 {
+                panic!("surface acquire failed after {attempts} retries");
+            }
+            // Yield to the compositor instead of busy-spinning (an occluded
+            // window can keep returning `Occluded`/`Timeout` for many frames).
+            std::thread::sleep(std::time::Duration::from_millis(8));
         }
     }
 

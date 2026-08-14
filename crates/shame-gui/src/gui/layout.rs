@@ -4,52 +4,6 @@
 use crate::math::Vec2;
 use crate::rect::Rect;
 
-/// Lays out `child_styles` inside `container` using the container's own style
-/// (gap, padding, direction) via a fresh, ephemeral taffy tree. Returns the
-/// child rects in pixel space, in the same order as `child_styles`.
-pub fn child_rects(
-    container_style: &taffy::Style,
-    child_styles: &[taffy::Style],
-    container: Rect,
-) -> Vec<Rect> {
-    let mut tree: taffy::TaffyTree = taffy::TaffyTree::new();
-    // Definite root width: children stretch to the container, not to the
-    // content-driven size a flex root would otherwise get.
-    let mut root_style = container_style.clone();
-    root_style.size = taffy::Size {
-        width: taffy::Dimension::length(container.size.x),
-        height: taffy::Dimension::auto(),
-    };
-    let root = tree.new_leaf(root_style).unwrap();
-    let mut nodes = Vec::with_capacity(child_styles.len());
-    for style in child_styles {
-        let node = tree.new_leaf(style.clone()).unwrap();
-        tree.add_child(root, node).unwrap();
-        nodes.push(node);
-    }
-    tree.compute_layout(
-        root,
-        taffy::Size {
-            width: taffy::AvailableSpace::Definite(container.size.x),
-            height: taffy::AvailableSpace::Definite(container.size.y),
-        },
-    )
-    .unwrap();
-    nodes
-        .into_iter()
-        .map(|node| {
-            let layout = tree.layout(node).unwrap();
-            Rect::new(
-                Vec2::new(
-                    container.pos.x + layout.location.x,
-                    container.pos.y + layout.location.y,
-                ),
-                Vec2::new(layout.size.width, layout.size.height),
-            )
-        })
-        .collect()
-}
-
 /// Table layout: one `[label | editor]` row per child. Row height follows
 /// the editor's own style; the label column is `label_width` wide with a
 /// `row_gap` between label and editor. Returns `(label_rect, editor_rect)`

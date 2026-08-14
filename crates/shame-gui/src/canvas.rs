@@ -11,11 +11,23 @@ use wgpu::{BufferUsages, LoadOp::*, StoreOp::*};
 
 use shame_wgpu as sm;
 
+use crate::gpu::MAX_IMMEDIATE_BYTES;
 use crate::graph::{DagStructRef, Port};
 use crate::instance::GpuStruct;
 use crate::material::{
     Draw, ErasedKey, GpuBufferSlot, InstanceArena, Material, MaterialBindings, MaterialHandle,
 };
+
+/// Panics when a push constant exceeds the device's `max_immediate_size`
+/// (wgpu's validation limit) — fail fast with a clear message instead of a
+/// wgpu validation error surfacing one frame later.
+fn check_immediate_size(bytes: &[u8]) {
+    assert!(
+        bytes.len() <= MAX_IMMEDIATE_BYTES,
+        "push constant is {} bytes; the device limit (max_immediate_size) is {MAX_IMMEDIATE_BYTES}",
+        bytes.len(),
+    );
+}
 
 /// A render slot: Canvas reads the gpu buffer, bind group, and push constant
 /// from state ports each frame and issues draw calls.
@@ -25,7 +37,12 @@ pub(crate) struct RenderSlot<S> {
     pub(crate) bind_group_port: Port<Option<Arc<wgpu::BindGroup>>, S>,
     pub(crate) has_fb_in_push_constant: bool,
     pub(crate) material_slot: Option<usize>,
-    pub(crate) register_material: Option<Box<dyn FnOnce(&mut Canvas<S>, &sm::Gpu) -> usize>>,
+    /// Re-run every frame: registers the *current* material value read from
+    /// the state's material port (`register_material` dedups by value, so
+    /// unchanged materials cost one map lookup; a changed value rebuilds the
+    /// pipeline).
+    pub(crate) register_material:
+        Option<Box<dyn Fn(&mut Canvas<S>, &sm::Gpu, &DagStructRef<S>) -> usize>>,
     pub(crate) read_push_constant: Box<dyn Fn(&S) -> Vec<u8>>,
 }
 
@@ -37,7 +54,9 @@ pub(crate) struct BatchedGroupSlot<S> {
     pub(crate) arena: Rc<RefCell<InstanceArena>>,
     pub(crate) has_fb_in_push_constant: bool,
     pub(crate) material_slot: Option<usize>,
-    pub(crate) register_material: Option<Box<dyn FnOnce(&mut Canvas<S>, &sm::Gpu) -> usize>>,
+    /// Re-run every frame — see [`RenderSlot::register_material`].
+    pub(crate) register_material:
+        Option<Box<dyn Fn(&mut Canvas<S>, &sm::Gpu, &DagStructRef<S>) -> usize>>,
     pub(crate) read_push_constant: Box<dyn Fn(&S) -> Vec<u8>>,
 }
 
@@ -168,6 +187,7 @@ impl<S> Canvas<S> {
     ) {
         let fast = self.fast(handle.index);
         let data_bytes = bytemuck::bytes_of(data);
+        check_immediate_size(data_bytes);
         let same = fast
             .push_batches
             .last()
@@ -262,37 +282,30 @@ impl<S> Canvas<S> {
         let depth_view = self.depth.as_ref().unwrap().1.clone();
         let fb = self.framebuffer_size();
 
-        // Phase 1: resolve material slots for first-time render slots.
+        // Phase 1: resolve material slots for render slots. Registrars re-run
+        // every frame and read the material port value from the state, so a
+        // changed material rebuilds the pipeline (`register_material` dedups
+        // by value, keeping unchanged materials a single map lookup). The
+        // closure is taken out of the slot so it can borrow `self` mutably.
         let render_count = self.render_slots.len();
-        let mut deferred: Vec<(usize, Box<dyn FnOnce(&mut Canvas<S>, &sm::Gpu) -> usize>)> =
-            Vec::new();
         for si in 0..render_count {
-            let slot = &mut self.render_slots[si];
-            if slot.material_slot.is_none() {
-                if let Some(register) = slot.register_material.take() {
-                    deferred.push((si, register));
-                }
+            let register = self.render_slots[si].register_material.take();
+            if let Some(register) = register {
+                let idx = register(self, gpu, state);
+                self.render_slots[si].material_slot = Some(idx);
+                self.render_slots[si].register_material = Some(register);
             }
-        }
-        for (si, register) in deferred {
-            let idx = register(self, gpu);
-            self.render_slots[si].material_slot = Some(idx);
         }
 
-        // Phase 1b: resolve material slots for first-time batched groups.
-        let mut deferred_bg: Vec<(usize, Box<dyn FnOnce(&mut Canvas<S>, &sm::Gpu) -> usize>)> =
-            Vec::new();
-        for gi in 0..self.batched_groups.len() {
-            let group = &mut self.batched_groups[gi];
-            if group.material_slot.is_none() {
-                if let Some(register) = group.register_material.take() {
-                    deferred_bg.push((gi, register));
-                }
+        // Phase 1b: resolve material slots for batched groups.
+        let bg_count = self.batched_groups.len();
+        for gi in 0..bg_count {
+            let register = self.batched_groups[gi].register_material.take();
+            if let Some(register) = register {
+                let idx = register(self, gpu, state);
+                self.batched_groups[gi].material_slot = Some(idx);
+                self.batched_groups[gi].register_material = Some(register);
             }
-        }
-        for (gi, register) in deferred_bg {
-            let idx = register(self, gpu);
-            self.batched_groups[gi].material_slot = Some(idx);
         }
 
         // Phase 2: upload fast-path GPU buffers.
@@ -418,6 +431,7 @@ impl<S> Canvas<S> {
                 if slot.has_fb_in_push_constant && push_bytes.len() >= 8 {
                     push_bytes[..8].copy_from_slice(bytemuck::bytes_of(&fb));
                 }
+                check_immediate_size(&push_bytes);
 
                 let index_count = match &mat.draw {
                     Draw::Primitive { indices } => indices.len() as u32,
@@ -451,6 +465,7 @@ impl<S> Canvas<S> {
                 if group.has_fb_in_push_constant && push_bytes.len() >= 8 {
                     push_bytes[..8].copy_from_slice(bytemuck::bytes_of(&fb));
                 }
+                check_immediate_size(&push_bytes);
 
                 let index_count = match &mat.draw {
                     Draw::Primitive { indices } => indices.len() as u32,

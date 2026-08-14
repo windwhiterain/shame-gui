@@ -145,7 +145,7 @@ impl<S> Gui<S> {
         match event {
             InputEvent::MouseDown { pos, .. } => {
                 if let Some((split_rect, dir, ratio)) =
-                    render::find_split_divider(&self.tree.root, root_rect, *pos)
+                    render::find_split_divider(&self.tree.root, root_rect, *pos, &*state)
                 {
                     self.drag = Some(DragState {
                         split_rect,
@@ -158,7 +158,7 @@ impl<S> Gui<S> {
             }
             InputEvent::MouseMove { pos, .. } => {
                 if let Some(drag) = &self.drag {
-                    render::apply_drag(&mut self.tree.root, root_rect, drag, *pos);
+                    render::apply_drag(&mut self.tree.root, root_rect, drag, *pos, &*state);
                     return;
                 }
             }

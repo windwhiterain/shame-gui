@@ -1,13 +1,13 @@
 //! # shame-gui
 //!
-//! A 2D retained-mode GUI framework built on [wgpu] and the [shame] Rust shader EDSL.
+//! A 2D immediate-mode GUI framework built on [wgpu] and the [shame] Rust shader EDSL.
 //!
 //! ## Architecture
 //!
 //! ```text
 //! App (window + event loop)
+//!  |-- State S (a #[derive(DagStruct)] struct; typed Port handles access its fields)
 //!  |-- DAG graph (dataflow: source ports -> compute nodes -> render ports)
-//!  |-- StateArena (typed value storage shared between graph and widgets)
 //!  `-- Viewport tree (split/tab/container layout -> WidgetNodes -> Widget trait)
 //!       `-- Canvas (material registry -> one draw call per material per frame -> GPU)
 //! ```
@@ -20,9 +20,12 @@
 //!
 //! ## Key concepts
 //!
-//! - **Ports, Arena, DAG** — State flows through typed `Port<T>` handles backed by a `StateArena`.
-//!   The DAG engine (`Graph`) runs nodes when their input ports are marked dirty
-//!   (by widget edits or source-port updates). See the [`graph`] module.
+//! - **Ports, State, DAG** — values live in a plain state struct `S`
+//!   (the global app state, or a collection element); typed `Port<D, S>`
+//!   handles read/write its fields through monomorphized accessors (no
+//!   downcasts, no runtime store). The DAG engine (`Graph`) runs nodes when
+//!   their input ports are marked dirty (by widget edits or source-port
+//!   updates). See the [`graph`] module.
 //! - **Widgets and Viewport** — The [`Widget`] trait defines how a value is rendered and edited.
 //!   `ViewportNode` builds a tree of splits, tabs, containers, and widget leaves.
 //!   See the [`gui`] module.
@@ -39,7 +42,7 @@
 //! | Module | Purpose |
 //! |--------|---------|
 //! | [`app`] | `App` — entry point, window loop, object management |
-//! | [`graph`] | DAG engine: `StateArena`, `Port`, `DagStruct`, `Graph` |
+//! | [`graph`] | DAG engine: `Port`, `DagStruct`, `Graph`, `BuiltinState` |
 //! | [`gui`] | Widget/viewport layer: `Widget` trait, `ViewportNode` tree, `Gui` |
 //! | [`math`] | GPU-compatible vector types: `Vec2`, `Vec4`, `Vec2u`, `Vec2i` |
 //! | [`rect`] | `Rect` — position + size with pixel→NDC conversion |

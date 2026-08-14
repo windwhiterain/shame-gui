@@ -32,7 +32,9 @@ pub const TAB_INACTIVE: Color = Color::rgb(0.3492, 0.3492, 0.3811);
 /// Active tab background.
 pub const TAB_ACTIVE: Color = Color::rgb(0.4845, 0.5371, 0.6262);
 
-/// Z layers: widgets draw above custom render slots (which use z < 0.5).
+/// Z layers: **smaller z = closer** (shared depth pass uses `less_equal`).
+/// The GUI draws in the 0.3–0.5 band; custom render slots / DAG objects
+/// should stay below 0.3 to render behind the widgets.
 /// Panel background layer.
 pub const Z_PANEL: f32 = 0.5;
 /// Widget border layer.
@@ -98,5 +100,5 @@ pub const MENU_PAD_X: f32 = 8.0;
 pub const MENU_PAD_Y: f32 = 4.0;
 /// Menu font size.
 pub const MENU_FONT_SIZE: f32 = 13.0;
-/// Menu layer (above everything else).
+/// Menu layer — the smallest z (closest), above everything else.
 pub const Z_MENU: f32 = 0.05;

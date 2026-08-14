@@ -78,6 +78,9 @@ impl<S> ViewportNode<S> {
                 if tab.tabs.is_empty() {
                     return taffy::Style::default();
                 }
+                // Only the *active* tab's child contributes its preferred
+                // size — switching tabs can change the node's size. That is
+                // intentional: inactive tabs are never laid out.
                 let active = tab.active.min(tab.tabs.len() - 1);
                 let child = tab.tabs[active].1.layout_style(state);
                 let cw = dim(child.size.width, child.min_size.width);
@@ -98,6 +101,7 @@ impl<S> ViewportNode<S> {
 // ── Split rect math ────────────────────────────────────────────────────
 
 /// Splits `rect` by `dir` and `ratio` into the two child rects.
+/// The ratio is clamped to [0.1, 0.9] so both panes always stay visible.
 pub fn split_rects(rect: Rect, dir: SplitDir, ratio: f32) -> (Rect, Rect) {
     let ratio = ratio.clamp(0.1, 0.9);
     match dir {

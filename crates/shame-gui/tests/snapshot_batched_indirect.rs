@@ -60,7 +60,7 @@ impl Material for NdcMaterial {
                 .assemble(position, sm::Draw::triangle_list(sm::Winding::Cw));
             let frag = primitive.rasterize(sm::Accuracy::default());
             let color_interp = frag.fill(color);
-            sm::discard_if(color_interp.w.lt(0.5));
+            sm::discard_if(color_interp.w.lt(shame_gui::shader::ALPHA_DISCARD));
             let mut targets = frag
                 .attachments
                 .depth_test::<sm::tf::Depth24Plus>(sm::DepthTest::less_equal(true));

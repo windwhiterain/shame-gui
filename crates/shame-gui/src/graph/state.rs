@@ -120,6 +120,11 @@ impl AppState for BuiltinState {
 
 /// Writes the framework source fields through a state reference (marking the
 /// source ports dirty so nodes reading them re-run). Used by `App::tick_dag`.
+///
+/// Each field is written only when its value actually changed — a static
+/// cursor or unchanged framebuffer does not mark `mouse_pos`/`framebuffer_size`
+/// dirty, so nodes reading them do not re-run every frame. `delta_time` and
+/// `elapsed` change every frame and are always written.
 pub fn write_source_fields<S: AppState>(
     r: &mut DagStructRef<S>,
     fb: Vec2u,
@@ -130,10 +135,22 @@ pub fn write_source_fields<S: AppState>(
     elapsed: f32,
 ) {
     let p = S::source_ports();
-    p.framebuffer_size.write(r, fb);
-    p.mouse_pos.write(r, cursor);
-    p.mouse_down.write(r, mouse_down);
-    p.scroll_delta.write(r, scroll);
-    p.delta_time.write(r, dt);
-    p.elapsed.write(r, elapsed);
+    if *p.framebuffer_size.read(r) != fb {
+        p.framebuffer_size.write(r, fb);
+    }
+    if *p.mouse_pos.read(r) != cursor {
+        p.mouse_pos.write(r, cursor);
+    }
+    if *p.mouse_down.read(r) != mouse_down {
+        p.mouse_down.write(r, mouse_down);
+    }
+    if *p.scroll_delta.read(r) != scroll {
+        p.scroll_delta.write(r, scroll);
+    }
+    if *p.delta_time.read(r) != dt {
+        p.delta_time.write(r, dt);
+    }
+    if *p.elapsed.read(r) != elapsed {
+        p.elapsed.write(r, elapsed);
+    }
 }

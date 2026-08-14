@@ -10,16 +10,13 @@ use crate::rect::Rect;
 use crate::shader::RectEntry;
 
 /// Cached state for a checkbox.
-pub struct BoolWidgetData {
-    /// Whether the cursor is currently over the box.
-    pub hovered: bool,
-}
+pub struct BoolWidgetData;
 
 impl WidgetData for BoolWidgetData {}
 
 impl Default for BoolWidgetData {
     fn default() -> Self {
-        Self { hovered: false }
+        Self
     }
 }
 
@@ -65,15 +62,11 @@ impl<S: 'static> Widget<S> for Port<bool, S> {
     fn on_event(
         &self,
         state: &mut DagStructRef<S>,
-        data: &mut Self::Data,
+        _data: &mut Self::Data,
         event: &InputEvent,
         rect: Rect,
     ) -> EventResponse {
         match event {
-            InputEvent::MouseMove { pos, .. } => {
-                data.hovered = rect.contains(*pos);
-                EventResponse::Consumed
-            }
             InputEvent::MouseDown { pos, button, .. } => {
                 if !rect.contains(*pos) {
                     return EventResponse::Ignored;

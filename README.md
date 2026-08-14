@@ -1,8 +1,8 @@
 # shame-gui
 
-A 2D immediate-mode GUI framework for [wgpu](https://github.com/gfx-rs/wgpu), built on the **[shame](https://github.com/anomalyco/shame)** Rust EDSL. GPU shaders are written in native Rust — no WGSL, no GLSL.
+A 2D immediate-mode GUI framework for [wgpu](https://github.com/gfx-rs/wgpu), built on the **[shame](https://github.com/windwhiterain/shame)** Rust EDSL. GPU shaders are written in native Rust — no WGSL, no GLSL.
 
-[Exaple App: Calcuator](crates/shame-gui/examples/calc.rs)
+[Example App: Calculator](crates/shame-gui/examples/calc.rs)
 
 > Early Stage: API Changes All The Time.
 
@@ -10,7 +10,7 @@ A 2D immediate-mode GUI framework for [wgpu](https://github.com/gfx-rs/wgpu), bu
 
 ### 1. State is the single source of truth
 
-Your application state is a plain Rust struct. `#[derive(DagStruct, Widget)]` on it generates everything needed to both **render editable widgets** for it and **flow it through a DAG** for computation and GPU rendering. The same arena slots are shared between the GUI and the DAG — no sync code, no glue, no duplication.
+Your application state is a plain Rust struct. `#[derive(DagStruct, Widget)]` on it generates everything needed to both **render editable widgets** for it and **flow it through a DAG** for computation and GPU rendering. The same struct is the single source of truth for the GUI and the DAG — widgets and nodes read/write its fields through typed `Port` handles; no sync code, no glue, no duplication.
 
 ### 2. Shaders are Rust functions
 
@@ -35,7 +35,7 @@ All logic and rendering flows through a **dependency-acyclic graph**. Nodes read
 
 - **App logic** — like the calculator above.
 - **Render ports** — feed `Vec<RectEntry>`, `Vec<TextObject>` into built-in fast-path draw calls.
-- **Custom render objects** — wire arena ports into GPU buffers and bind groups, then into draw calls, via `App::register_render_object`.
+- **Custom render objects** — wire state ports into GPU buffers and bind groups, then into draw calls, via `App::register_render_object`.
 
 ### 4. ViewportRect bridges layout and GPU
 
@@ -47,7 +47,7 @@ Each example teaches one concept:
 
 | Example | Concept |
 |---|---|
-| `calc` | DagStruct + Widget derive, build_state_ports, state→DAG→GUI |
+| `calc` | DagStruct + Widget derive, `ports()`, state→DAG→GUI |
 | `form` | into_viewport_nodes, into_tab_nodes, split/tab/container nesting |
 | `rects` | Fast-path fills & outlines, custom gradient material |
 | `text` | TextObject, wrap width, z-ordering |
@@ -64,16 +64,16 @@ cargo run -p shame-gui --example push_constant
 
 ```mermaid
 flowchart TD
-    Widgets["Widget Tree<BR>taffy layout"] -->|edits| Arena["StateArena<BR>typed port slots"]
-    Arena -->|reads| DAG["DAG Graph<BR>dirty-triggered eval"]
-    DAG -->|writes| Arena
+    Widgets["Widget Tree<BR>taffy layout"] -->|edits| State["State S<BR>#[derive(DagStruct)] struct"]
+    State -->|reads| DAG["DAG Graph<BR>dirty-triggered eval"]
+    DAG -->|writes| State
     Widgets -->|fills, outlines, texts| Render[Render Objects]
     DAG -->|instance data, push constants| Render
     Render -->|draw calls| Canvas["Canvas<BR>wgpu rendering"]
 ```
 
-- **StateArena** — typed slot storage. Values live at `PortId`s; multiple `Port<T>` handles can share the same slot. No deletion, no fragmentation.
-- **DAG** — nodes declare inputs and outputs as port IDs. First tick runs every node; subsequent ticks run only nodes whose inputs are dirty.
+- **State** — a plain `#[derive(DagStruct)]` struct (the global app state, or one map element). Values live as its fields; typed `Port<D, S>` handles read/write them through monomorphized accessors — no runtime store, no downcasts.
+- **DAG** — nodes declare inputs and outputs as port groups (port IDs). First tick runs every node; subsequent ticks run only nodes whose inputs are dirty.
 - **Widget tree** — built from `ViewportNode` variants (`Widget`, `Split`, `Tab`, `Container`). Layout uses taffy for containers, pixel arithmetic for splits and tabs.
 - **Canvas** — one pipeline per material, one draw call per render-object registration. Depth-testing with `less_equal` handles z-ordering.
 - **Snapshot tests** — pixel-exact GPU comparisons against golden images. Each scene is its own test binary (winit `EventLoop` limitation).
@@ -81,5 +81,5 @@ flowchart TD
 ## Design decisions
 
 - **Panic-fast** — no `Result`/`Error`. Unwrap and expect everywhere.
-- **Physical pixels, y-down** — all coordinates are physical pixels with origin at top-left. `Rect::to_ndc(fb_size)` is the only NDC conversion point.
+- **Physical pixels, y-down** — all coordinates are physical pixels with origin at top-left. The pixel→NDC formula lives once in `dual::rect_to_ndc` (CPU: `Rect::to_ndc`; GPU: the built-in materials' vertex shaders).
 - **Smaller z = closer** — `Depth24Plus` with `less_equal`. Shared across rect and text passes.

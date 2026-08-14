@@ -73,6 +73,12 @@ impl TextObject {
     }
 }
 
+/// Line height for a font size. cosmic-text `Metrics` needs it up front,
+/// so it must be computable before shaping (here: font_size * 1.2, ceiled).
+fn line_height(font_size: f32) -> f32 {
+    (font_size * 1.2).ceil()
+}
+
 /// Owns the font system, glyph cache, GPU atlas, and text renderer.
 /// Created outside `App::run()` — `measure()` is available immediately.
 /// GPU resources are lazily initialized on the first frame when the
@@ -127,10 +133,9 @@ impl TextSystem {
     /// Callable before, during, or after `App::run()` — it only uses the
     /// `FontSystem`, no GPU resources.
     pub fn measure(&mut self, text: &str, font_size: f32, wrap_width: Option<f32>) -> Vec2 {
-        let line_height = (font_size * 1.2).ceil();
         let mut buffer = cosmic_text::Buffer::new(
             &mut self.font_system,
-            cosmic_text::Metrics::new(font_size, line_height),
+            cosmic_text::Metrics::new(font_size, line_height(font_size)),
         );
         buffer.set_text(
             &mut self.font_system,
@@ -227,10 +232,9 @@ impl TextSystem {
         let mut depths: Vec<f32> = Vec::with_capacity(self.objects.len());
 
         for (area_index, obj) in self.objects.iter().enumerate() {
-            let line_height = (obj.font_size * 1.2).ceil();
             let mut buffer = cosmic_text::Buffer::new(
                 &mut self.font_system,
-                cosmic_text::Metrics::new(obj.font_size, line_height),
+                cosmic_text::Metrics::new(obj.font_size, line_height(obj.font_size)),
             );
             // glyphon's `prepare_with_depth` maps each glyph to a depth via
             // its `LayoutGlyph.metadata` — which comes from the Attrs. Stamp
@@ -267,10 +271,12 @@ impl TextSystem {
                     bottom: i32::MAX,
                 },
                 default_color: cosmic_text::Color::rgba(
-                    (obj.color.r * 255.0) as u8,
-                    (obj.color.g * 255.0) as u8,
-                    (obj.color.b * 255.0) as u8,
-                    (obj.color.a * 255.0) as u8,
+                    // Round (not truncate) and clamp, so fractional sRGB
+                    // components map to the nearest 8-bit value.
+                    (obj.color.r * 255.0).round().clamp(0.0, 255.0) as u8,
+                    (obj.color.g * 255.0).round().clamp(0.0, 255.0) as u8,
+                    (obj.color.b * 255.0).round().clamp(0.0, 255.0) as u8,
+                    (obj.color.a * 255.0).round().clamp(0.0, 255.0) as u8,
                 ),
                 custom_glyphs: &[],
             });

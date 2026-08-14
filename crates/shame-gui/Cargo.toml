@@ -11,9 +11,9 @@ winit.workspace = true
 bytemuck.workspace = true
 pollster.workspace = true
 shame_gui_derive = { path = "../shame_gui_derive" }
-taffy = "0.13.0"
-glyphon = "0.11"
-cosmic-text = "0.18"
+taffy.workspace = true
+glyphon.workspace = true
+cosmic-text.workspace = true
 
 [dev-dependencies]
 image = { version = "0.25.10", default-features = false, features = ["png"] }

@@ -2,6 +2,8 @@
 //! simulates a sequence of clicks and verifies a rect is placed at each
 //! clicked position.
 
+#![allow(dead_code)] // scenes bring fn main() and unused test helpers
+
 #[path = "../examples/click_rects.rs"]
 mod scene;
 

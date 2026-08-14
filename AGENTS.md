@@ -36,7 +36,7 @@
 
 ## Commands (PowerShell, from repo root)
 
-- `python check.py` — cargo check + `cargo fix --allow-dirty` + cargo fmt. Run before committing.
+- `python clean.py` — cargo check + `cargo fix --allow-dirty` + cargo fmt. **Mutates sources** (fix + fmt); review the diff after running. Run before committing.
 - `cargo test -p shame-gui` — all tests including pixel-exact snapshot tests (no feature flag). Each scene is its own test binary. `actual.png` must match `expected.png`; missing goldens auto-accept. Only commit `expected.png`.
 - never run `cargo clippy`.
 - Do not run tests or `cargo build` from repo root — use `-p shame-gui`.

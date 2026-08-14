@@ -130,11 +130,13 @@ pub fn walk_event<S>(
     let is_focused = event.routing() == RoutingMode::Focused;
     match node {
         ViewportNode::Widget(widget) => {
-            // Focused events (keyboard/char): only route to the focused WidgetNode.
+            // Focused events (keyboard/char): only route to the focused
+            // WidgetNode — and skip the hit test, since key events carry no
+            // meaningful position.
             if is_focused && *focus != Some(widget.id) {
                 return EventResponse::Ignored;
             }
-            if !visit_all && !rect.contains(pos) {
+            if !is_focused && !visit_all && !rect.contains(pos) {
                 return EventResponse::Ignored;
             }
             // MouseDown on a selectable WidgetNode claims focus.
@@ -193,12 +195,15 @@ pub fn walk_event<S>(
                 return EventResponse::Ignored;
             };
             if is_focused {
-                for (_, child) in children.iter_mut() {
-                    if let ViewportNode::Widget(w) = child {
-                        if *focus == Some(w.id) {
-                            let r = w.widget.on_event(state, event, rect);
-                            return r;
-                        }
+                // Keyboard/char events: route through every row's editor rect
+                // (walk_event's widget branch picks the focused node; the
+                // position hit test is skipped for focused events). This also
+                // reaches widgets nested inside split/tab/container children.
+                for ((_, child), (_, editor_rect)) in children.iter_mut().zip(rows.iter()) {
+                    if walk_event(child, *editor_rect, event, focus, state)
+                        == EventResponse::Consumed
+                    {
+                        return EventResponse::Consumed;
                     }
                 }
                 return EventResponse::Ignored;
@@ -312,6 +317,7 @@ pub fn find_split_divider<S>(
     node: &ViewportNode<S>,
     rect: Rect,
     pos: Vec2,
+    state: &DagStructRef<S>,
 ) -> Option<(Rect, SplitDir, f32)> {
     match node {
         ViewportNode::Split(split) => {
@@ -321,12 +327,12 @@ pub fn find_split_divider<S>(
             }
             let (r0, r1) = split_rects(inner, split.dir, split.ratio);
             if r0.contains(pos) {
-                if let Some(found) = find_split_divider(&split.children[0], r0, pos) {
+                if let Some(found) = find_split_divider(&split.children[0], r0, pos, state) {
                     return Some(found);
                 }
             }
             if r1.contains(pos) {
-                return find_split_divider(&split.children[1], r1, pos);
+                return find_split_divider(&split.children[1], r1, pos, state);
             }
             None
         }
@@ -335,12 +341,17 @@ pub fn find_split_divider<S>(
                 return None;
             }
             let active = tab.active.min(tab.tabs.len() - 1);
-            find_split_divider(&tab.tabs[active].1, tab_content_rect(rect), pos)
+            find_split_divider(&tab.tabs[active].1, tab_content_rect(rect), pos, state)
         }
         ViewportNode::Widget(_) => None,
         ViewportNode::Container(children) => {
-            for (_, child) in children {
-                if let Some(found) = find_split_divider(child, rect, pos) {
+            // Children sit in per-row editor rects (container_table_rects);
+            // the container's own rect would place dividers at wrong offsets.
+            let Some(rows) = container_table_rects(children, rect, state) else {
+                return None;
+            };
+            for ((_, child), (_, editor_rect)) in children.iter().zip(rows.iter()) {
+                if let Some(found) = find_split_divider(child, *editor_rect, pos, state) {
                     return Some(found);
                 }
             }
@@ -350,7 +361,13 @@ pub fn find_split_divider<S>(
 }
 
 /// Applies a drag to the split whose rect matches `drag.split_rect`.
-pub fn apply_drag<S>(node: &mut ViewportNode<S>, rect: Rect, drag: &DragState, pos: Vec2) {
+pub fn apply_drag<S>(
+    node: &mut ViewportNode<S>,
+    rect: Rect,
+    drag: &DragState,
+    pos: Vec2,
+    state: &DagStructRef<S>,
+) {
     match node {
         ViewportNode::Split(split) => {
             let inner = split_margin_rect(rect, split.dir);
@@ -369,20 +386,29 @@ pub fn apply_drag<S>(node: &mut ViewportNode<S>, rect: Rect, drag: &DragState, p
                 return;
             }
             let (r0, r1) = split_rects(inner, split.dir, split.ratio);
-            apply_drag(&mut split.children[0], r0, drag, pos);
-            apply_drag(&mut split.children[1], r1, drag, pos);
+            apply_drag(&mut split.children[0], r0, drag, pos, state);
+            apply_drag(&mut split.children[1], r1, drag, pos, state);
         }
         ViewportNode::Tab(tab) => {
             if tab.tabs.is_empty() {
                 return;
             }
             let active = tab.active.min(tab.tabs.len() - 1);
-            apply_drag(&mut tab.tabs[active].1, tab_content_rect(rect), drag, pos);
+            apply_drag(
+                &mut tab.tabs[active].1,
+                tab_content_rect(rect),
+                drag,
+                pos,
+                state,
+            );
         }
         ViewportNode::Widget(_) => {}
         ViewportNode::Container(children) => {
-            for (_, child) in children.iter_mut() {
-                apply_drag(child, rect, drag, pos);
+            let Some(rows) = container_table_rects(children, rect, state) else {
+                return;
+            };
+            for ((_, child), (_, editor_rect)) in children.iter_mut().zip(rows.iter()) {
+                apply_drag(child, *editor_rect, drag, pos, state);
             }
         }
     }

@@ -1,5 +1,7 @@
 //! Text snapshot test.
 
+#![allow(dead_code)] // scenes bring fn main() and unused test helpers
+
 mod common;
 
 #[path = "../examples/text.rs"]

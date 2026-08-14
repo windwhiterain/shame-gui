@@ -1,6 +1,10 @@
-"""Project verification: cargo check + cargo fix + cargo fmt.
+"""Project cleanup pipeline: cargo check + cargo fix + cargo fmt.
 
-Usage: python check.py
+Note: this script MODIFIES the tree — `cargo fix` rewrites sources to
+apply compiler suggestions and `cargo fmt` reformats. Run before
+committing, and review the diff afterwards.
+
+Usage: python clean.py
 """
 
 import subprocess
@@ -19,4 +23,4 @@ for command in COMMANDS:
         print(f"FAILED: {' '.join(command)}")
         sys.exit(result.returncode)
 
-print("check.py: all checks passed.")
+print("clean.py: all checks passed.")

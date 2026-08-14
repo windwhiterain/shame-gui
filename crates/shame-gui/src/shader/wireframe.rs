@@ -32,14 +32,12 @@ impl Material for WireframeMaterial {
             let color = instance.color;
             let z = instance.z;
 
-            // Build a RectGpu from the Ref fields, then use the shared NDC formula.
-            let rect_v = crate::rect::RectGpu {
-                pos: sm::vec!(ppos.x, ppos.y),
-                size: sm::vec!(psize.x, psize.y),
-            };
-            let ndc = shame_gui::dual::rect_to_ndc::<crate::rect::RectGpu, true>(rect_v, fb);
-            let pos = ndc.pos;
-            let size = ndc.size;
+            // Shared pixel→NDC formula (see `dual::pixel_rect_to_ndc_gpu`).
+            let (pos, size) = crate::dual::pixel_rect_to_ndc_gpu(
+                sm::vec!(ppos.x, ppos.y),
+                sm::vec!(psize.x, psize.y),
+                fb,
+            );
 
             let positions: sm::Array<sm::vec<f32, x3>, Size<4>> = [
                 pos.extend(z),
@@ -52,7 +50,7 @@ impl Material for WireframeMaterial {
             let primitive = drawcall.vertices.assemble(position, sm::Draw::line_list());
             let frag = primitive.rasterize(sm::Accuracy::default());
             let color_interp: sm::vec<f32, x4> = frag.fill(color);
-            sm::discard_if(color_interp.w.lt(0.5));
+            sm::discard_if(color_interp.w.lt(crate::shader::ALPHA_DISCARD));
             let mut targets = frag
                 .attachments
                 .depth_test::<sm::tf::Depth24Plus>(sm::DepthTest::less_equal(true));

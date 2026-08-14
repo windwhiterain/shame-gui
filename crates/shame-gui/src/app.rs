@@ -230,8 +230,13 @@ impl<S: AppState> App<S> {
             bind_group_port: bind_group,
             has_fb_in_push_constant: has_fb,
             material_slot: None,
-            register_material: Some(Box::new(move |canvas: &mut Canvas<S>, gpu| {
-                canvas.register_material(gpu, M::default()).index
+            register_material: Some(Box::new(move |canvas: &mut Canvas<S>, gpu, state| {
+                // Register the *current* material value from the state, not
+                // `M::default()` — register_material dedups by value, and a
+                // changed material port rebuilds the pipeline.
+                canvas
+                    .register_material(gpu, mat_p.read(state).clone())
+                    .index
             })),
             read_push_constant: push_bytes::<M::PushConstant, S>(constant),
         });
@@ -300,12 +305,17 @@ impl<S: AppState> App<S> {
         }
 
         let has_fb = M::HAS_FB_PUSH_CONSTANT;
+        let mat_p = material;
         self.pending_batched_groups.push(BatchedGroupSlot {
             arena,
             has_fb_in_push_constant: has_fb,
             material_slot: None,
-            register_material: Some(Box::new(move |canvas: &mut Canvas<S>, gpu| {
-                canvas.register_material(gpu, M::default()).index
+            register_material: Some(Box::new(move |canvas: &mut Canvas<S>, gpu, state| {
+                // Register the *current* material value from the state — a
+                // changed material port rebuilds the shared pipeline.
+                canvas
+                    .register_material(gpu, mat_p.read(state).clone())
+                    .index
             })),
             read_push_constant: push_bytes::<M::PushConstant, S>(constant),
         });
@@ -391,12 +401,17 @@ impl<S: AppState> App<S> {
         );
 
         let has_fb = M::HAS_FB_PUSH_CONSTANT;
+        let mat_p = material;
         self.pending_batched_groups.push(BatchedGroupSlot {
             arena,
             has_fb_in_push_constant: has_fb,
             material_slot: None,
-            register_material: Some(Box::new(move |canvas: &mut Canvas<S>, gpu| {
-                canvas.register_material(gpu, M::default()).index
+            register_material: Some(Box::new(move |canvas: &mut Canvas<S>, gpu, state| {
+                // Register the *current* material value from the state — a
+                // changed material port rebuilds the shared pipeline.
+                canvas
+                    .register_material(gpu, mat_p.read(state).clone())
+                    .index
             })),
             read_push_constant: push_bytes::<M::PushConstant, S>(constant),
         });
@@ -572,30 +587,30 @@ struct FrameApp<S: AppState> {
 
 impl<S: AppState> FrameApp<S> {
     fn tick_dag(&mut self, gpu: Option<&sm::Gpu>) {
-        if !self.graph.is_active() {
-            return;
+        if self.graph.is_active() {
+            let dt = self.last_instant.elapsed().as_secs_f32();
+            self.last_instant = Instant::now();
+            self.elapsed += dt;
+
+            let fb_size = self.canvas.as_ref().unwrap().framebuffer_size();
+            {
+                let mut dagref = self.graph.with_state(&mut self.state);
+                write_source_fields(
+                    &mut dagref,
+                    fb_size,
+                    self.cursor,
+                    self.mouse_down,
+                    self.scroll_delta,
+                    dt,
+                    self.elapsed,
+                );
+            }
+            self.scroll_delta = 0.0;
+
+            self.graph.tick(&mut self.state, gpu);
         }
-        let dt = self.last_instant.elapsed().as_secs_f32();
-        self.last_instant = Instant::now();
-        self.elapsed += dt;
 
-        let fb_size = self.canvas.as_ref().unwrap().framebuffer_size();
-        {
-            let mut dagref = self.graph.with_state(&mut self.state);
-            write_source_fields(
-                &mut dagref,
-                fb_size,
-                self.cursor,
-                self.mouse_down,
-                self.scroll_delta,
-                dt,
-                self.elapsed,
-            );
-        }
-        self.scroll_delta = 0.0;
-
-        self.graph.tick(&mut self.state, gpu);
-
+        // after_tick runs even when the graph is inactive — mirrors `App::step`.
         if let Some(ref mut runner) = self.runner {
             let ctx = crate::capture::AppContext {
                 state: &self.state,
@@ -657,8 +672,10 @@ impl<S: AppState> FrameApp<S> {
     }
 
     fn handle_redraw(&mut self, event_loop: &ActiveEventLoop) {
-        let gpu_ptr: *const sm::Gpu = &self.gpu_setup.as_ref().unwrap().gpu;
-        self.tick_dag(unsafe { Some(&*gpu_ptr) });
+        // `sm::Gpu` is an Arc clone of device + queue, so the DAG can borrow
+        // a private copy — no raw pointer into `gpu_setup`.
+        let gpu = self.gpu_setup.as_ref().unwrap().gpu.clone();
+        self.tick_dag(Some(&gpu));
 
         let window = Arc::clone(self.window.as_ref().unwrap());
         let gpu_setup = self.gpu_setup.as_mut().unwrap();

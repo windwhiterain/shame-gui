@@ -64,8 +64,13 @@ impl Material for PushDemoMaterial {
             );
             let z = instance.z;
 
-            let pos = sm::vec!(ppos.x, fb.y - ppos.y - psize.y) * 2.0 / fb - 1.0 + offset;
-            let size = psize * 2.0 / fb;
+            // Shared pixel→NDC formula, then the per-instance NDC offset.
+            let (pos, size) = shame_gui::dual::pixel_rect_to_ndc_gpu(
+                sm::vec!(ppos.x, ppos.y),
+                sm::vec!(psize.x, psize.y),
+                fb,
+            );
+            let pos = pos + offset;
 
             let positions: sm::Array<sm::vec<f32, x3>, Size<4>> = [
                 pos.extend(z),
@@ -80,7 +85,7 @@ impl Material for PushDemoMaterial {
                 .assemble(position, sm::Draw::triangle_list(sm::Winding::Cw));
             let frag = primitive.rasterize(sm::Accuracy::default());
             let color_interp: sm::vec<f32, x4> = frag.fill(color);
-            sm::discard_if(color_interp.w.lt(0.5));
+            sm::discard_if(color_interp.w.lt(shame_gui::shader::ALPHA_DISCARD));
             let mut targets = frag
                 .attachments
                 .depth_test::<sm::tf::Depth24Plus>(sm::DepthTest::less_equal(true));

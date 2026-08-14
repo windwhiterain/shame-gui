@@ -9,6 +9,10 @@ pub mod wireframe;
 pub use rect::{RectEntry, RectInstance, RectInstanceGpu, RectMaterial};
 pub use wireframe::WireframeMaterial;
 
+/// Minimum alpha for a fragment to survive the built-in materials' discard;
+/// below this the fragment is dropped (no blending is used).
+pub const ALPHA_DISCARD: f32 = 0.5;
+
 /// Viewport uniform passed as push constant to GUI materials that do
 /// pixel→NDC conversion in the vertex shader.
 #[derive(crate::GpuStruct, Clone, Copy, Default)]

@@ -54,7 +54,11 @@ impl<S: 'static> Widget<S> for Port<ViewportRect, S> {
         rect: Rect,
         _ctx: &mut RenderContext,
     ) {
-        self.write(state, ViewportRect { rect });
+        // Write (and mark dirty) only when the assigned rect actually changed,
+        // so downstream DAG nodes do not re-run on every frame.
+        if self.read(state).rect != rect {
+            self.write(state, ViewportRect { rect });
+        }
     }
 
     fn on_event(

@@ -69,6 +69,13 @@ pub trait WidgetData: 'static {}
 
 /// Type-erased widget handle + data pair. `render`/`on_event` are
 /// monomorphized fn pointers over the concrete widget type.
+///
+/// `data` is `UnsafeCell`-backed because `render`/`layout_style` read it
+/// through `&self` while `on_event` writes it through `&self`; the read and
+/// write borrows never coexist. This is sound only under the GUI's
+/// non-reentrant, single-threaded walk — a widget callback must never
+/// dispatch events recursively, and a widget must not be shared across
+/// threads.
 pub struct AnyWidget<S> {
     widget: Box<dyn Any>,
     data: UnsafeCell<Box<dyn Any>>,

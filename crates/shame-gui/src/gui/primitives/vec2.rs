@@ -30,22 +30,33 @@ impl EditingField {
 
     fn insert_char(&mut self, ch: char) {
         self.buffer.insert(self.cursor, ch);
-        self.cursor += 1;
+        // Advance by the char's byte length, not 1 — a multi-byte char would
+        // otherwise leave the cursor mid-char.
+        self.cursor += ch.len_utf8();
     }
 
     fn backspace(&mut self) {
         if self.cursor > 0 {
-            self.buffer.remove(self.cursor - 1);
-            self.cursor -= 1;
+            // Remove the whole character before the cursor (the cursor always
+            // sits on a char boundary, but `cursor - 1` may be mid-char).
+            let start = self.buffer.floor_char_boundary(self.cursor - 1);
+            self.buffer.remove(start);
+            self.cursor = start;
         }
     }
 
     fn cursor_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+        // Step back one whole character, not one byte — byte offsets inside
+        // a multi-byte char panic on insert/remove.
+        self.cursor = self
+            .buffer
+            .floor_char_boundary(self.cursor.saturating_sub(1));
     }
 
     fn cursor_right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.buffer.len());
+        self.cursor = self
+            .buffer
+            .ceil_char_boundary((self.cursor + 1).min(self.buffer.len()));
     }
 
     fn commit<F: FnOnce(f32)>(&mut self, set: F) {
@@ -70,7 +81,9 @@ impl EditingField {
             s.insert(c, '|');
             s
         } else {
-            format!("{:.1}", value)
+            // Full precision (same as number.rs) — `{:.1}` would display
+            // e.g. 0.05 as "0.1", diverging from the actual value.
+            value.to_string()
         }
     }
 }

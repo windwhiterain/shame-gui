@@ -100,24 +100,36 @@ impl<S: 'static> Widget<S> for Port<String, S> {
             InputEvent::Char { ch } if data.editing => {
                 if !ch.is_control() {
                     data.buffer.insert(data.cursor, *ch);
-                    data.cursor += 1;
+                    // Advance by the char's byte length, not 1 — a multi-byte
+                    // char would otherwise leave the cursor mid-char.
+                    data.cursor += ch.len_utf8();
                 }
                 EventResponse::Consumed
             }
             InputEvent::KeyDown { key } if data.editing => match key {
                 Key::Backspace => {
                     if data.cursor > 0 {
-                        data.buffer.remove(data.cursor - 1);
-                        data.cursor -= 1;
+                        // Remove the whole character before the cursor (the
+                        // cursor always sits on a char boundary, but
+                        // `cursor - 1` may be inside a multi-byte char).
+                        let start = data.buffer.floor_char_boundary(data.cursor - 1);
+                        data.buffer.remove(start);
+                        data.cursor = start;
                     }
                     EventResponse::Consumed
                 }
                 Key::ArrowLeft => {
-                    data.cursor = data.cursor.saturating_sub(1);
+                    // Step back one whole character, not one byte — byte
+                    // offsets inside a multi-byte char panic on insert/remove.
+                    data.cursor = data
+                        .buffer
+                        .floor_char_boundary(data.cursor.saturating_sub(1));
                     EventResponse::Consumed
                 }
                 Key::ArrowRight => {
-                    data.cursor = (data.cursor + 1).min(data.buffer.len());
+                    data.cursor = data
+                        .buffer
+                        .ceil_char_boundary((data.cursor + 1).min(data.buffer.len()));
                     EventResponse::Consumed
                 }
                 Key::Enter => {

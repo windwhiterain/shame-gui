@@ -117,8 +117,12 @@ pub fn read_frame_rgba(
         submission_index: None,
         timeout: None,
     });
-    if !matches!(rx.recv(), Ok(Ok(()))) {
-        return Vec::new();
+    // Panic with the actual failure instead of returning an empty buffer —
+    // a silent empty Vec only surfaces later as a confusing downstream panic.
+    match rx.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("frame readback failed: map_async error {e}"),
+        Err(e) => panic!("frame readback failed: map callback channel closed: {e}"),
     }
 
     let data = buffer.slice(..).get_mapped_range();
