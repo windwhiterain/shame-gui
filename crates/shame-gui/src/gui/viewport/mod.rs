@@ -2,10 +2,10 @@
 //! [`ViewportTree`], with sub-modules for node definitions, layout math,
 //! event/render walks, and the right-click split menu.
 
-mod context;
-mod layout;
-mod node;
-mod render;
+pub(crate) mod context;
+pub(crate) mod layout;
+pub(crate) mod node;
+pub(crate) mod render;
 
 use crate::canvas::Canvas;
 use crate::graph::DagStructRef;

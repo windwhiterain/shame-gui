@@ -23,4 +23,4 @@ pub mod widget;
 pub use event::{EventResponse, InputEvent, Key, MouseButton, RoutingMode, event_pos};
 pub use shame_gui_derive::Widget;
 pub use viewport::{Gui, SplitDir, SplitNode, ViewportNode, ViewportTree};
-pub use widget::{AnyWidget, RenderContext, Widget, WidgetData, WidgetNode};
+pub use widget::{AnyWidget, RenderContext, Widget, WidgetData, WidgetElement, WidgetNode};

@@ -277,7 +277,7 @@ fn execute_split<S>(
 
 /// Deep-clones a ViewportNode tree. WidgetNodes are duplicated (sharing
 /// port accessors); Split/Tab/Container trees are cloned recursively.
-fn deep_duplicate_viewport<S>(node: &ViewportNode<S>) -> ViewportNode<S> {
+pub(crate) fn deep_duplicate_viewport<S>(node: &ViewportNode<S>) -> ViewportNode<S> {
     match node {
         ViewportNode::Widget(widget) => ViewportNode::Widget(widget.duplicate()),
         ViewportNode::Split(split) => ViewportNode::Split(SplitNode {

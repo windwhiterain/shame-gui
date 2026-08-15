@@ -19,9 +19,14 @@ use std::rc::Rc;
 
 use crate::graph::port::PortId;
 
-/// Dirty tracking for a single element (`key`) of a map port.
+/// Dirty tracking for a single element (`key`) of a map port, or for one
+/// plain struct field (see [`DagStructRef::with_field_dirty`]).
+///
+/// `#[doc(hidden)]` — public only so the `DagStruct` derive can reference it
+/// from user crates (`note_full_write` on struct fields).
+#[doc(hidden)]
 #[derive(Clone)]
-pub(crate) struct ElemDirty {
+pub struct ElemDirty {
     /// The whole element was mutated (`MapEntry::read_mut()`, or an
     /// overwriting `Port::insert`) → reprocess it regardless of which element
     /// ports the node reads.
@@ -164,6 +169,58 @@ impl<'a, S> DagStructRef<'a, S> {
     /// non-map type here.
     pub(crate) fn mark_map_full<K: 'static>(&mut self, id: PortId) {
         self.with_map_dirty::<K>(id, |m| m.full = true);
+    }
+
+    /// Gets (creating if absent) the field-dirty record for a plain struct
+    /// field port id and calls `f` with it. `#[doc(hidden)]` — public only so
+    /// the `DagStruct` derive can emit `note_full_write` overrides from user
+    /// crates: a whole-field write (`Port<T, S>::write`/`read_mut`) marks the
+    /// field record `full`, so render-tree field steps reprocess the whole
+    /// subtree. Struct fields and map ports share the store, keyed by
+    /// distinct per-state field ids.
+    #[doc(hidden)]
+    pub fn with_field_dirty(&mut self, id: PortId, f: impl FnOnce(&mut ElemDirty)) {
+        let mut store = self.map_dirty.borrow_mut();
+        let entry = store
+            .entry(id)
+            .or_insert_with(|| Box::new(ElemDirty::new()));
+        f(entry
+            .downcast_mut::<ElemDirty>()
+            .expect("field dirty record type mismatch"));
+    }
+
+    /// Gets (creating if absent) the shared per-field dirty sets for a plain
+    /// struct field port id. The returned `Rc`s are shared with the store, so
+    /// writes through a ref built on them stay visible to `add_map_tree_node`
+    /// field steps and to [`Port::with_field_ref`](crate::graph::Port::with_field_ref)
+    /// post-checks.
+    pub(crate) fn ensure_field_ref(
+        &mut self,
+        id: PortId,
+    ) -> (
+        Rc<RefCell<HashSet<PortId>>>,
+        Rc<RefCell<HashMap<PortId, Box<dyn Any>>>>,
+    ) {
+        let mut store = self.map_dirty.borrow_mut();
+        let entry = store
+            .entry(id)
+            .or_insert_with(|| Box::new(ElemDirty::new()));
+        let ed = entry
+            .downcast_mut::<ElemDirty>()
+            .expect("field dirty record type mismatch");
+        (ed.ports.clone(), ed.nested.clone())
+    }
+
+    /// Clones the field-dirty record for a plain struct field port id (empty
+    /// if none). The clone shares the record's per-field `Rc` handles, so the
+    /// caller sees live writes.
+    pub(crate) fn snapshot_field_dirty(&self, id: PortId) -> ElemDirty {
+        self.map_dirty
+            .borrow()
+            .get(&id)
+            .and_then(|r| r.downcast_ref::<ElemDirty>())
+            .cloned()
+            .unwrap_or_else(ElemDirty::new)
     }
 
     /// Clones the accumulated dirty record for a map port (empty if none yet).

@@ -102,3 +102,26 @@ pub const MENU_PAD_Y: f32 = 4.0;
 pub const MENU_FONT_SIZE: f32 = 13.0;
 /// Menu layer — the smallest z (closest), above everything else.
 pub const Z_MENU: f32 = 0.05;
+
+/// Map widget (`HashMap<String, T>`): per-key header row height.
+pub const MAP_HEADER_H: f32 = 22.0;
+/// Map widget: add-row height at the bottom.
+pub const MAP_ADD_H: f32 = 26.0;
+/// Map widget: expander box size (square, drawn with rects).
+pub const MAP_EXPANDER: f32 = 10.0;
+/// Map widget: delete / add button width.
+pub const MAP_BTN_W: f32 = 24.0;
+/// Map widget: horizontal indent for the expanded element form.
+pub const MAP_INDENT: f32 = 8.0;
+/// Map widget: fallback expanded row height (all primitives are 24 tall);
+/// replaced by measured heights once rendered.
+pub const MAP_ROW_H: f32 = 24.0;
+/// Map widget: header row background.
+pub const MAP_HEADER_BG: Color = Color::rgb(0.36, 0.36, 0.39);
+/// Map widget: delete button text color.
+pub const MAP_DELETE_TEXT: Color = Color::rgb(0.85, 0.45, 0.45);
+
+/// Selector widget (`MapSelector`): header row height (the click-to-open bar).
+pub const SELECTOR_HEADER_H: f32 = 22.0;
+/// Selector widget: option row height in the open key list.
+pub const SELECTOR_ROW_H: f32 = 24.0;

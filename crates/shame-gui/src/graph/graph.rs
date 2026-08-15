@@ -15,7 +15,7 @@ use std::rc::Rc;
 use shame_wgpu as sm;
 
 use crate::graph::element::DagStructRef;
-use crate::graph::port::{DagStruct, Port, PortGroup, PortId};
+use crate::graph::port::{DagStruct, Port, PortGroup, PortId, PortValue};
 
 /// A node in the graph.
 struct NodeEntry<S> {
@@ -400,8 +400,9 @@ impl<S: DagStruct> Graph<S> {
 
     /// Registers a **render-tree** node over `map`: a single flat node that
     /// descends an arbitrarily deep `HashMap` hierarchy via `path` — one
-    /// [`MapPath`] per map level, ending in [`LeafMarker`] — running `leaf`
-    /// once per bottom-level element that needs reprocessing.
+    /// [`MapPath`] per map level and/or one [`FieldPath`] per plain struct
+    /// field, ending in [`LeafMarker`] — running `leaf` once per bottom-level
+    /// element that needs reprocessing.
     ///
     /// The graph stays flat (one node for the whole tree). Every level fans
     /// out with the same record-driven dirty machinery as [`Graph::add_map_node`],
@@ -568,11 +569,12 @@ impl<S: DagStruct> Graph<S> {
 
 /// The descent from a map's element type down to the leaves of a render tree.
 ///
-/// Implemented by [`MapPath`] (one more map level) and [`LeafMarker`] (the
-/// bottom map's elements are the leaves). [`Graph::add_map_tree_node`] drives
-/// the whole path from one flat node: each level fans out over its map with
-/// the same record-driven dirty machinery as [`Graph::add_map_node`], so only
-/// changed subtrees reprocess at any depth.
+/// Implemented by [`MapPath`] (one more map level), [`FieldPath`] (a plain
+/// struct field level), and [`LeafMarker`] (the bottom map's elements are
+/// the leaves). [`Graph::add_map_tree_node`] drives the whole path from one
+/// flat node: each level fans out with the same record-driven dirty
+/// machinery as [`Graph::add_map_node`], so only changed subtrees reprocess
+/// at any depth.
 pub trait RenderPath<T>: Clone + 'static {
     /// The bottom element type — what the leaf eval runs on.
     type Leaf: Clone + 'static;
@@ -728,6 +730,87 @@ where
         for el in self.map.read_state(e).values() {
             self.next.collect(el, out, leaf_collect);
         }
+    }
+}
+
+/// One struct-field level of a [`RenderPath`]: `field` is a plain struct
+/// field of the parent element type `T`, and `next` describes the descent
+/// from its value. Use it to cross a struct level between maps (e.g.
+/// `groups → audio (struct) → presets (map)`).
+///
+/// The field's dirty record (an `ElemDirty`, keyed by the field's id) is
+/// shared with the widget-side
+/// [`Port::with_field_ref`](crate::graph::Port::with_field_ref), so a leaf
+/// edit under the field reprocesses exactly that leaf, a whole-field write
+/// (`Port<T, N>::write`/`read_mut` — the derive marks the record `full`)
+/// reprocesses the whole subtree, and the field level has no add/remove
+/// semantics.
+pub struct FieldPath<T, N, P: RenderPath<N>>
+where
+    T: 'static,
+    N: PortValue + 'static,
+{
+    /// The struct field of `T` whose value the next level descends.
+    pub field: Port<N, T>,
+    /// The descent from the field's value.
+    pub next: P,
+}
+
+// `Port` is Copy, so only the next level needs cloning.
+impl<T: 'static, N: PortValue + 'static, P: RenderPath<N> + Clone> Clone for FieldPath<T, N, P> {
+    fn clone(&self) -> Self {
+        Self {
+            field: self.field,
+            next: self.next.clone(),
+        }
+    }
+}
+
+impl<T: 'static, N: PortValue + 'static, P: RenderPath<N>> RenderPath<T> for FieldPath<T, N, P> {
+    type Leaf = P::Leaf;
+
+    fn map_id(&self) -> Option<PortId> {
+        Some(self.field.id())
+    }
+
+    fn descend(
+        &self,
+        gref: &mut DagStructRef<T>,
+        gpu: Option<&sm::Gpu>,
+        full: bool,
+        trigger: PortId,
+        leaf: &mut impl FnMut(&mut DagStructRef<Self::Leaf>, Option<&sm::Gpu>),
+    ) -> bool {
+        // The field record decides whether the subtree reprocesses: a
+        // whole-field write sets `full`; leaf edits under it record into the
+        // shared nested store (checked against the next level's id) or into
+        // the record's ports (the trigger check at the bottom level).
+        let fd = gref.snapshot_field_dirty(self.field.id());
+        let full = full || fd.full;
+        let next_id = self.next.map_id();
+        let bottom = next_id.is_none();
+        let dirty = next_id.is_some_and(|id| fd.nested.borrow().contains_key(&id))
+            || (bottom && fd.ports.borrow().contains(&trigger));
+        if !full && !dirty {
+            return false;
+        }
+        // Get-or-create the shared record so writes through the field ref
+        // stay visible to the record machinery (mirrors `ensure_elem_ports`).
+        let (ports, nested) = gref.ensure_field_ref(self.field.id());
+        let fired = Rc::new(RefCell::new(HashSet::new()));
+        let value = self.field.read_mut_state(gref.inner_mut());
+        let mut fref = DagStructRef::new_with(value, ports, fired, nested);
+        self.next.descend(&mut fref, gpu, full, trigger, leaf)
+    }
+
+    fn collect(
+        &self,
+        e: &T,
+        out: &mut Vec<u32>,
+        leaf_collect: &mut impl FnMut(&Self::Leaf, &mut Vec<u32>),
+    ) {
+        self.next
+            .collect(self.field.read_state(e), out, leaf_collect);
     }
 }
 

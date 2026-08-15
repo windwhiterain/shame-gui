@@ -2,7 +2,8 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::spanned::Spanned;
 use syn::{
-    DeriveInput, Fields, ItemStruct, Meta, Token, parse_macro_input, punctuated::Punctuated,
+    DeriveInput, Expr, ExprLit, Fields, ItemStruct, Lit, Meta, Token, parse_macro_input,
+    punctuated::Punctuated,
 };
 
 /// Convert a snake_case identifier to PascalCase for associated type names.
@@ -415,7 +416,10 @@ pub fn derive_gpu_struct(input: TokenStream) -> TokenStream {
 ///   Vec<(String, ViewportNode<Self>)>` — **table** mode, each field is a row
 ///   of `[label | editor]`, the field name being the label;
 /// - `#[widget(tab)]`: `into_tab_nodes(ports) ->
-///   Vec<(String, Vec<(String, ViewportNode<Self>)>)>` — **tabs** mode.
+///   Vec<(String, Vec<(String, ViewportNode<Self>)>)>` — **tabs** mode;
+/// - `#[widget(selector = "map_field")]` on a `String` field: that row's
+///   editor becomes a `MapSelector` over the named `HashMap<String, T>`
+///   field of the same struct instead of a plain text input.
 ///
 /// # Requirements
 ///
@@ -470,6 +474,117 @@ fn field_is_skipped(field: &syn::Field) -> bool {
     })
 }
 
+/// The map field named by `#[widget(selector = "field")]`, if present.
+/// Errors on a malformed selector attribute (non-string value).
+fn field_selector_map(field: &syn::Field) -> Result<Option<String>, syn::Error> {
+    let mut result = None;
+    for attr in &field.attrs {
+        if !attr.path().is_ident("widget") {
+            continue;
+        }
+        let Meta::List(list) = &attr.meta else {
+            continue;
+        };
+        let parsed: Punctuated<Meta, Token![,]> =
+            list.parse_args_with(Punctuated::parse_terminated)?;
+        for meta in parsed {
+            let Meta::NameValue(name_value) = meta else {
+                continue;
+            };
+            if !name_value.path.is_ident("selector") {
+                continue;
+            }
+            let Expr::Lit(ExprLit {
+                lit: Lit::Str(s), ..
+            }) = &name_value.value
+            else {
+                return Err(syn::Error::new(
+                    field.span(),
+                    "#[widget(selector = ...)] expects a string field name, e.g. #[widget(selector = \"teams\")]",
+                ));
+            };
+            result = Some(s.value());
+        }
+    }
+    Ok(result)
+}
+
+/// True when the type is exactly `String`.
+fn type_is_string(ty: &syn::Type) -> bool {
+    let syn::Type::Path(tp) = ty else {
+        return false;
+    };
+    tp.path.is_ident("String")
+}
+
+/// True when the type is `HashMap<String, _>` (any value type, any path
+/// prefix — `std::collections::HashMap<String, T>` included).
+fn type_is_hashmap_string(ty: &syn::Type) -> bool {
+    let syn::Type::Path(tp) = ty else {
+        return false;
+    };
+    let Some(segment) = tp.path.segments.last() else {
+        return false;
+    };
+    if segment.ident != "HashMap" {
+        return false;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return false;
+    };
+    let Some(syn::GenericArgument::Type(first)) = args.args.first() else {
+        return false;
+    };
+    type_is_string(first)
+}
+
+/// Validates `#[widget(selector = "...")]` attributes across all fields: the
+/// annotated field must be a `String`, and the named map field must exist
+/// and be a `HashMap<String, T>`.
+fn validate_selector_attrs(
+    fields: &Punctuated<syn::Field, syn::token::Comma>,
+) -> Result<(), syn::Error> {
+    for field in fields {
+        let Some(map_name) = field_selector_map(field)? else {
+            continue;
+        };
+        if field_is_skipped(field) {
+            return Err(syn::Error::new(
+                field.span(),
+                "#[widget(skip)] and #[widget(selector = ...)] are mutually exclusive",
+            ));
+        }
+        if !type_is_string(&field.ty) {
+            return Err(syn::Error::new(
+                field.span(),
+                "#[widget(selector = ...)] requires a `String` field",
+            ));
+        }
+        let map_field = fields.iter().find(|f| {
+            f.ident
+                .as_ref()
+                .is_some_and(|ident| ident.to_string() == map_name)
+        });
+        let Some(map_field) = map_field else {
+            return Err(syn::Error::new(
+                field.span(),
+                format!(
+                    "#[widget(selector = \"{map_name}\")] references an unknown field `{map_name}`"
+                ),
+            ));
+        };
+        if !type_is_hashmap_string(&map_field.ty) {
+            return Err(syn::Error::new(
+                field.span(),
+                format!(
+                    "#[widget(selector = \"{map_name}\")] field `{map_name}` must be a `HashMap<String, T>`"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// True if the field's type is the built-in [`BuiltinState`], which the
 /// [`state`](macro@state) attribute macro injects. Such a field holds the
 /// framework's source/render state and is never rendered as a widget.
@@ -518,22 +633,40 @@ fn expand_widget(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
         .iter()
         .filter(|f| !field_is_skipped(f) && !field_type_is_builtin_state(f))
         .collect();
+    validate_selector_attrs(fields)?;
 
     let node_exprs: Vec<_> = rendered_fields
         .iter()
-        .map(|field| {
+        .map(|field| -> Result<proc_macro2::TokenStream, syn::Error> {
             let fname = field.ident.as_ref().unwrap();
             let ty = &field.ty;
-            quote! {
-                ::shame_gui::gui::ViewportNode::Widget(
-                    ::shame_gui::gui::WidgetNode::new(
-                        ports.#fname,
-                        <::shame_gui::graph::Port<#ty, #name> as ::shame_gui::gui::Widget<#name>>::Data::default(),
+            if let Some(map_name) = field_selector_map(field)? {
+                // `#[widget(selector = "map")]`: a two-port dropdown instead
+                // of the plain text input (validated above).
+                let map_name = format_ident!("{}", map_name);
+                Ok(quote! {
+                    ::shame_gui::gui::ViewportNode::Widget(
+                        ::shame_gui::gui::WidgetNode::new(
+                            ::shame_gui::gui::primitives::selector::MapSelector::new(
+                                ports.#map_name,
+                                ports.#fname,
+                            ),
+                            ::shame_gui::gui::primitives::selector::SelectorData::default(),
+                        )
                     )
-                )
+                })
+            } else {
+                Ok(quote! {
+                    ::shame_gui::gui::ViewportNode::Widget(
+                        ::shame_gui::gui::WidgetNode::new(
+                            ports.#fname,
+                            <::shame_gui::graph::Port<#ty, #name> as ::shame_gui::gui::Widget<#name>>::Data::default(),
+                        )
+                    )
+                })
             }
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
 
     let pairs: Vec<_> = rendered_fields
         .iter()
@@ -582,7 +715,27 @@ fn expand_widget(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
         }
     };
 
-    Ok(output)
+    // The trait form of `into_viewport_nodes` — how a `HashMap<String, T>`
+    // map widget builds its per-element child template generically. Emitted
+    // in both modes (tab mode still renders a plain field list when used as
+    // a map element).
+    let widget_element = quote! {
+        impl ::shame_gui::gui::WidgetElement for #name {
+            fn into_viewport_nodes(
+            ) -> ::std::vec::Vec<(
+                ::std::string::String,
+                ::shame_gui::gui::ViewportNode<#name>,
+            )> {
+                let ports = <#name as ::shame_gui::graph::DagStruct>::ports();
+                ::std::vec![#(#pairs),*]
+            }
+        }
+    };
+
+    Ok(quote! {
+        #output
+        #widget_element
+    })
 }
 
 /// Derives `DagStruct` for a named-field struct: generates a `{Name}Ports`
@@ -680,7 +833,15 @@ fn expand_dag_struct(input: &DeriveInput) -> Result<proc_macro2::TokenStream, sy
             }
         }
 
-        impl ::shame_gui::graph::PortValue for #name {}
+        impl ::shame_gui::graph::PortValue for #name {
+            /// A whole-field write of a `Port<#name, S>` marks the field's
+            /// shared dirty record `full`, so render-tree field steps
+            /// ([`FieldPath`](::shame_gui::graph::FieldPath)) reprocess the
+            /// whole subtree instead of skipping it.
+            fn note_full_write<S>(r: &mut ::shame_gui::graph::DagStructRef<S>, id: ::shame_gui::graph::PortId) {
+                r.with_field_dirty(id, |f| f.full = true);
+            }
+        }
 
         impl ::shame_gui::graph::DagStruct for #name {
             type Ports = #ports_name;

@@ -1,6 +1,7 @@
 //! Render-tree batched snapshot: the top map's elements each provide a push
 //! constant (a tint color), the leaves below them provide instance data. One
-//! indirect dispatch per top-level element.
+//! indirect dispatch per top-level element. The descent crosses a plain
+//! struct field ([`FieldPath`]) before the leaf map.
 
 #![allow(dead_code)]
 
@@ -13,6 +14,7 @@ use shame_gui::Vec2;
 use shame_gui::Vec2u;
 use shame_gui::Vec4;
 use shame_gui::app::App;
+use shame_gui::graph::FieldPath;
 use shame_gui::graph::LeafMarker;
 use shame_gui::graph::MapPath;
 use shame_gui::material::{Draw, GpuInstanceBuffer, InstanceBuffer, Material, PipelineData};
@@ -93,10 +95,18 @@ impl Material for GroupMaterial {
     }
 }
 
-/// A top-level element: one push constant + a map of instance leaves.
+/// A top-level element: one push constant + a struct field holding the
+/// instance-leaf map.
 #[derive(Clone, Default, DagStruct)]
 struct Group {
     constant: GroupParams,
+    child_set: ChildSet,
+}
+
+/// The struct field between `Group` and its leaves — a plain field level in
+/// the render-tree path.
+#[derive(Clone, Default, DagStruct)]
+struct ChildSet {
     children: HashMap<u32, Element>,
 }
 
@@ -142,7 +152,7 @@ fn render_tree_scene() -> App<TreeState> {
                     color: Vec4::new(1.0, 1.0, 1.0, 1.0),
                     z: 0.1,
                 });
-                group.children.insert(
+                group.child_set.children.insert(
                     j as u32,
                     Element {
                         cpu_buffer: ib,
@@ -156,14 +166,18 @@ fn render_tree_scene() -> App<TreeState> {
 
     let p = TreeState::ports();
     let g = Group::ports();
+    let cs = ChildSet::ports();
     let el = Element::ports();
     app.register_render_tree_batched(
         p.material,
         p.groups,
         g.constant,
-        MapPath {
-            map: g.children,
-            next: LeafMarker::new(),
+        FieldPath {
+            field: g.child_set,
+            next: MapPath {
+                map: cs.children,
+                next: LeafMarker::new(),
+            },
         },
         el.cpu_buffer,
         el.gpu_buffer,

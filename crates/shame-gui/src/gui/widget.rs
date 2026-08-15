@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::graph::DagStructRef;
 use crate::gui::event::{EventResponse, InputEvent};
+use crate::gui::viewport::node::ViewportNode;
 use crate::math::Vec2u;
 use crate::rect::Rect;
 use crate::shader::RectEntry;
@@ -66,6 +67,19 @@ pub trait Widget<S>: 'static + Clone {
 
 /// Marker for the cached-state struct paired with a widget.
 pub trait WidgetData: 'static {}
+
+/// A `#[derive(Widget)]` struct usable as the element type of a
+/// [`Port<HashMap<String, T>, S>`](crate::graph::Port) map widget: provides
+/// the per-field child-widget template rendered when an entry is expanded.
+///
+/// Implemented automatically by the `Widget` derive (the same method it
+/// generates as an inherent `into_viewport_nodes()`); the trait form is how
+/// the map widget builds its template generically.
+pub trait WidgetElement: Sized + 'static {
+    /// The labelled child-widget template for this struct, one node per
+    /// non-`#[widget(skip)]` field.
+    fn into_viewport_nodes() -> Vec<(String, ViewportNode<Self>)>;
+}
 
 /// Type-erased widget handle + data pair. `render`/`on_event` are
 /// monomorphized fn pointers over the concrete widget type.

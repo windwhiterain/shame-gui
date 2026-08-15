@@ -1,7 +1,9 @@
 //! Render-tree batched rendering: the top map's elements each provide a push
 //! constant (a tint color), and the leaves below them provide instance data.
 //! One indirect dispatch per top-level element — its constant, drawing the
-//! instances of every leaf in its subtree.
+//! instances of every leaf in its subtree. The descent crosses a plain
+//! struct field ([`FieldPath`]) before the leaf map — the struct level
+//! between maps is transparent to the batching.
 //!
 //! Run with: cargo run -p shame-gui --example render_tree
 
@@ -13,7 +15,7 @@ use shame_gui::Vec2u;
 use shame_gui::Vec4;
 use shame_gui::app::App;
 use shame_gui::color::Color;
-use shame_gui::graph::{LeafMarker, MapPath};
+use shame_gui::graph::{FieldPath, LeafMarker, MapPath};
 use shame_gui::material::{Draw, GpuInstanceBuffer, InstanceBuffer, Material, PipelineData};
 use shame_gui::rect::Rect;
 use shame_gui::shader::RectInstance;
@@ -93,10 +95,18 @@ impl Material for GroupMaterial {
     }
 }
 
-/// One top-level element: a push constant + a map of instance leaves.
+/// One top-level element: a push constant + a struct field holding the
+/// instance-leaf map (the tree crosses the field with `FieldPath`).
 #[derive(Clone, Default, DagStruct)]
 struct Group {
     constant: GroupParams,
+    child_set: ChildSet,
+}
+
+/// The struct field between `Group` and its leaves — a plain field level in
+/// the render-tree path.
+#[derive(Clone, Default, DagStruct)]
+struct ChildSet {
     children: HashMap<u32, Element>,
 }
 
@@ -151,23 +161,28 @@ fn main() {
                 z: 0.1,
             });
             leaf.cpu_buffer = ib;
-            group.children.insert(0, leaf);
+            group.child_set.children.insert(0, leaf);
             s.groups.insert(i as u32, group);
         }
     }
 
     let p = TreeState::ports();
     let g = Group::ports();
+    let cs = ChildSet::ports();
     let el = Element::ports();
     // One batch per group: the group's constant + the slots of its leaves.
-    // Nest `MapPath` once per map level to go deeper.
+    // Nest `FieldPath` to cross plain struct fields and `MapPath` per map
+    // level to go deeper.
     app.register_render_tree_batched(
         p.material,
         p.groups,
         g.constant,
-        MapPath {
-            map: g.children,
-            next: LeafMarker::new(),
+        FieldPath {
+            field: g.child_set,
+            next: MapPath {
+                map: cs.children,
+                next: LeafMarker::new(),
+            },
         },
         el.cpu_buffer,
         el.gpu_buffer,

@@ -157,6 +157,40 @@ impl<D: PortValue, S> Port<D, S> {
     pub fn read_mut_state<'s>(&self, s: &'s mut S) -> &'s mut D {
         (self.read_mut)(s)
     }
+
+    /// Borrows this field through a [`DagStructRef`], runs `f` with the
+    /// sub-state ref, and marks this port dirty afterwards if any sub-port
+    /// was actually written through it.
+    ///
+    /// The plain-field counterpart of the map machinery's per-element borrow
+    /// ([`Port::get`](Self::get) + [`MapEntry::dagref`]): a nested
+    /// `#[derive(DagStruct, Widget)]` struct field is bridged to its own
+    /// [`DagStructRef`] so its widgets can render and edit it. The sub-state
+    /// tracks into a **shared** per-field record (`ElemDirty`, keyed by this
+    /// port's id in the state's dirty store) — the same record render-tree
+    /// field steps ([`crate::graph::FieldPath`]) consume, so a leaf edit
+    /// under the field reprocesses exactly that leaf. The sub-state's
+    /// `PortId`s (numbered from 0, like `S`'s) never enter this state's flat
+    /// dirty set; the post-walk check turns any sub-write into a coarse
+    /// "whole field changed" wakeup of this port — read-only walks
+    /// (render/layout) mark nothing. Chains one level at a time to reach
+    /// arbitrary nesting depth.
+    pub fn with_field_ref<'s, R>(
+        &self,
+        state: &'s mut DagStructRef<'_, S>,
+        f: impl for<'a> FnOnce(&mut DagStructRef<'a, D>) -> R,
+    ) -> R {
+        let dirty = state.dirty_rc();
+        let (ports, nested) = state.ensure_field_ref(self.id());
+        let fired = Rc::new(RefCell::new(HashSet::new()));
+        let value = self.read_mut_state(state.inner_mut());
+        let mut fref = DagStructRef::new_with(value, ports.clone(), fired, nested);
+        let out = f(&mut fref);
+        if !ports.borrow().is_empty() {
+            dirty.borrow_mut().insert(self.id());
+        }
+        out
+    }
 }
 
 impl<S> Port<bool, S> {
@@ -220,7 +254,22 @@ impl<K: Clone + Eq + std::hash::Hash + 'static, V: Clone + 'static, S> MapEntry<
     /// cells.get(&mut eref, 3).read_mut().cpu_buffer.push(&rect);
     /// ```
     pub fn dagref(&mut self) -> DagStructRef<'_, V> {
-        self.dirty_set.borrow_mut().insert(self.port.id());
+        self.dagref_impl(true)
+    }
+
+    /// Like [`dagref`](Self::dagref), but does **not** mark the map port
+    /// dirty. For read-mostly widget paths (rendering): element ports used
+    /// through the returned ref still record per-key, so the caller can mark
+    /// the map port only when a write actually happened — a render pass that
+    /// only reads must not wake the map nodes every frame.
+    pub fn dagref_unmarked(&mut self) -> DagStructRef<'_, V> {
+        self.dagref_impl(false)
+    }
+
+    fn dagref_impl(&mut self, mark: bool) -> DagStructRef<'_, V> {
+        if mark {
+            self.dirty_set.borrow_mut().insert(self.port.id());
+        }
         let mut store = self.map_dirty.borrow_mut();
         let record = store
             .entry(self.port.id())

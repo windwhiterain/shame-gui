@@ -1,7 +1,8 @@
 //! Arbitrary-depth render-tree fan-out: `Graph::add_map_tree_node` descends a
 //! `HashMap` hierarchy of any depth from one flat node, reprocessing only the
 //! subtrees the nested dirty records name. Mirrors `nested_map.rs`, but the
-//! levels are driven by a single node over a recursive [`MapPath`].
+//! levels are driven by a single node over a recursive [`MapPath`] — with
+//! [`FieldPath`] crossing plain struct fields between map levels.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -9,6 +10,7 @@ use std::rc::Rc;
 
 use shame_gui::DagStruct;
 use shame_gui::graph::DagStructRef;
+use shame_gui::graph::FieldPath;
 use shame_gui::graph::Graph;
 use shame_gui::graph::LeafMarker;
 use shame_gui::graph::MapPath;
@@ -544,6 +546,89 @@ fn depth_two_path_squares_immediately() {
 }
 
 #[test]
+fn widget_side_constant_write_reprocesses_nothing() {
+    // Mirrors `register_render_tree_batched`: the tree's trigger is the leaf
+    // read port (the cpu buffer there), and each top element carries its own
+    // constant. A widget-side write of a *constant* — a top-element port, not
+    // the trigger — must not reprocess any leaf: no re-upload, no slot churn.
+    let mut graph = Graph::new();
+    let counter = Rc::new(Cell::new(0usize));
+    let p = PairState::ports();
+    let map = p.pairs;
+
+    {
+        let m = map;
+        graph.add_node(
+            move |gref: &mut DagStructRef<PairState>, _gpu| {
+                let mut cur = m.read(gref).clone();
+                if cur.is_empty() {
+                    let mut p1 = Pair::default();
+                    p1.constant = 5.0;
+                    p1.leaves.insert(0, Leaf { x: 2.0, y: 0.0 });
+                    p1.leaves.insert(1, Leaf { x: 3.0, y: 0.0 });
+                    let mut p2 = Pair::default();
+                    p2.constant = 7.0;
+                    p2.leaves.insert(0, Leaf { x: 4.0, y: 0.0 });
+                    cur.insert(1, p1);
+                    cur.insert(2, p2);
+                    m.write(gref, cur);
+                }
+            },
+            (),
+            map,
+            None,
+        );
+    }
+
+    {
+        let c = counter.clone();
+        let pair = Pair::ports();
+        let l = Leaf::ports();
+        graph.add_map_tree_node(
+            map,
+            MapPath {
+                map: pair.leaves,
+                next: LeafMarker::new(),
+            },
+            l.x.id(),
+            move |eref: &mut DagStructRef<Leaf>, _gpu| {
+                c.set(c.get() + 1);
+                let x = *l.x.read(eref);
+                l.y.write(eref, x * x);
+            },
+        );
+    }
+
+    let mut state = PairState::default();
+    graph.tick(&mut state, None);
+    assert_eq!(counter.get(), 3, "three leaves across two pairs");
+
+    // The widget edits pair 1's constant through a tracked element ref — the
+    // per-port write records only `constant`, never `full`.
+    {
+        let mut r = graph.with_state(&mut state);
+        let pair = Pair::ports();
+        let mut p1 = map.get(&mut r, 1).unwrap();
+        let mut eref = p1.dagref();
+        pair.constant.write(&mut eref, 99.0);
+    }
+
+    graph.tick(&mut state, None);
+    assert_eq!(counter.get(), 3, "constant write reprocesses no leaves");
+    let pairs = map.read_state(&state);
+    assert_eq!(pairs[&1].constant, 99.0, "constant updated in place");
+    assert_eq!(pairs[&1].leaves[&1].y, 9.0, "leaf data untouched");
+    assert_eq!(pairs[&2].leaves[&0].y, 16.0, "other pair untouched");
+
+    graph.tick(&mut state, None);
+    assert_eq!(
+        counter.get(),
+        3,
+        "subsequent clean tick still reprocesses nothing"
+    );
+}
+
+#[test]
 fn depth_one_leaf_at_top_path() {
     // A leaf-at-top path: the top map's elements are the leaves, so the tree
     // node behaves like the flat map registration (the trigger port is the
@@ -620,4 +705,291 @@ fn depth_one_leaf_at_top_path() {
     let pairs = map.read_state(&state);
     assert_eq!(pairs[&1].constant, 4.0, "chained bump then doubled");
     assert_eq!(pairs[&2].constant, 6.0);
+}
+
+// ── Field steps (plain struct fields between map levels) ────────────────
+
+/// A struct field between the top map and the leaf map: the tree crosses it
+/// with [`FieldPath`], and widget-side access through the shared field
+/// record (`Port::with_field_ref`) reprocesses exactly the changed leaf.
+#[derive(Clone, Default, PartialEq, Debug, DagStruct)]
+pub struct Rig {
+    pub name: String,
+    pub leaves: HashMap<u32, Leaf>,
+}
+
+#[derive(Clone, Default, PartialEq, Debug, DagStruct)]
+pub struct RigGroup {
+    pub rig: Rig,
+    pub total: f32,
+}
+
+#[state]
+#[derive(Clone, Default, DagStruct)]
+pub struct RigState {
+    pub rigs: HashMap<u32, RigGroup>,
+}
+
+/// Seeds two groups (group 1: 2 leaves, group 2: 1 leaf — 3 leaves total).
+fn seed_rigs(g: &mut Graph<RigState>, map: Port<HashMap<u32, RigGroup>, RigState>) {
+    let m = map;
+    g.add_node(
+        move |gref: &mut DagStructRef<RigState>, _gpu| {
+            let mut cur = m.read(gref).clone();
+            if cur.is_empty() {
+                let mut g1 = RigGroup::default();
+                g1.rig.name = "main".to_string();
+                g1.rig.leaves.insert(0, Leaf { x: 2.0, y: 0.0 });
+                g1.rig.leaves.insert(1, Leaf { x: 3.0, y: 0.0 });
+                let mut g2 = RigGroup::default();
+                g2.rig.leaves.insert(0, Leaf { x: 4.0, y: 0.0 });
+                cur.insert(1, g1);
+                cur.insert(2, g2);
+                m.write(gref, cur);
+            }
+        },
+        (),
+        map,
+        None,
+    );
+}
+
+/// A 3-level tree with a struct field in the middle
+/// (`rigs → rig (field) → leaves`), squaring `x` into `y` per leaf.
+fn build_field_step() -> (
+    Graph<RigState>,
+    Port<HashMap<u32, RigGroup>, RigState>,
+    Rc<Cell<usize>>,
+) {
+    let mut graph = Graph::new();
+    let counter = Rc::new(Cell::new(0usize));
+    let p = RigState::ports();
+    let map = p.rigs;
+
+    seed_rigs(&mut graph, map);
+
+    {
+        let c = counter.clone();
+        let rg = RigGroup::ports();
+        let rig = Rig::ports();
+        let l = Leaf::ports();
+        graph.add_map_tree_node(
+            map,
+            FieldPath {
+                field: rg.rig,
+                next: MapPath {
+                    map: rig.leaves,
+                    next: LeafMarker::new(),
+                },
+            },
+            l.x.id(),
+            move |eref: &mut DagStructRef<Leaf>, _gpu| {
+                c.set(c.get() + 1);
+                let x = *l.x.read(eref);
+                l.y.write(eref, x * x);
+            },
+        );
+    }
+
+    (graph, map, counter)
+}
+
+#[test]
+fn field_step_first_tick_processes_all_leaves() {
+    let (mut graph, map, counter) = build_field_step();
+    let mut state = RigState::default();
+
+    graph.tick(&mut state, None);
+    assert_eq!(counter.get(), 3, "three leaves across two rigs");
+    let rigs = map.read_state(&state);
+    assert_eq!(rigs[&1].rig.leaves[&0].y, 4.0);
+    assert_eq!(rigs[&1].rig.leaves[&1].y, 9.0);
+    assert_eq!(rigs[&2].rig.leaves[&0].y, 16.0);
+}
+
+#[test]
+fn field_step_widget_side_leaf_edit_reprocesses_only_that_leaf() {
+    // Widget-side access through the field widget's bridge: `with_field_ref`
+    // shares the field record with the graph, so a leaf edit under the field
+    // reprocesses exactly that leaf — no other leaf, no other group.
+    let (mut graph, map, counter) = build_field_step();
+    let mut state = RigState::default();
+    graph.tick(&mut state, None);
+    assert_eq!(counter.get(), 3);
+
+    {
+        let mut r = graph.with_state(&mut state);
+        let rg = RigGroup::ports();
+        let rig = Rig::ports();
+        let mut g1 = map.get(&mut r, 1).unwrap();
+        let mut eref = g1.dagref();
+        rg.rig.with_field_ref(&mut eref, |fref| {
+            let mut l0 = rig.leaves.get(fref, 0).unwrap();
+            l0.read_mut().x = 10.0;
+        });
+    }
+
+    graph.tick(&mut state, None);
+    assert_eq!(counter.get(), 4, "only leaf 0 of group 1 reprocessed");
+    let rigs = map.read_state(&state);
+    assert_eq!(rigs[&1].rig.leaves[&0].y, 100.0);
+    assert_eq!(
+        rigs[&1].rig.leaves[&1].y, 9.0,
+        "sibling leaf in the same rig untouched"
+    );
+    assert_eq!(rigs[&2].rig.leaves[&0].y, 16.0, "other group untouched");
+}
+
+#[test]
+fn field_step_whole_field_write_reprocesses_full_subtree() {
+    // A chained map node (before the tree) replaces each group's whole `rig`
+    // field; the derive's `note_full_write` marks the field record `full`, so
+    // the tree reprocesses the group's whole subtree — not just one leaf.
+    let mut graph = Graph::new();
+    let counter = Rc::new(Cell::new(0usize));
+    let p = RigState::ports();
+    let map = p.rigs;
+
+    seed_rigs(&mut graph, map);
+
+    {
+        let rg = RigGroup::ports();
+        graph.add_map_node(map, (), (), (), rg.rig, move |_gref, _gpu, _k, eref| {
+            let mut rig = rg.rig.read(eref).clone();
+            rig.name = format!("{}!", rig.name);
+            rg.rig.write(eref, rig);
+        });
+    }
+
+    {
+        let c = counter.clone();
+        let rg = RigGroup::ports();
+        let rig = Rig::ports();
+        let l = Leaf::ports();
+        graph.add_map_tree_node(
+            map,
+            FieldPath {
+                field: rg.rig,
+                next: MapPath {
+                    map: rig.leaves,
+                    next: LeafMarker::new(),
+                },
+            },
+            l.x.id(),
+            move |eref: &mut DagStructRef<Leaf>, _gpu| {
+                c.set(c.get() + 1);
+                let x = *l.x.read(eref);
+                l.y.write(eref, x * x);
+            },
+        );
+    }
+
+    let mut state = RigState::default();
+    graph.tick(&mut state, None);
+    assert_eq!(counter.get(), 3, "first tick: full pass");
+    let rigs = map.read_state(&state);
+    assert_eq!(rigs[&1].rig.name, "main!", "chained stage bumped it");
+
+    // The widget replaces group 1's whole rig field through a tracked ref.
+    {
+        let mut r = graph.with_state(&mut state);
+        let rg = RigGroup::ports();
+        let mut g1 = map.get(&mut r, 1).unwrap();
+        let mut eref = g1.dagref();
+        let mut rig = rg.rig.read(&eref).clone();
+        rig.leaves.get_mut(&0).unwrap().x = 12.0;
+        rg.rig.write(&mut eref, rig);
+    }
+
+    graph.tick(&mut state, None);
+    assert_eq!(
+        counter.get(),
+        5,
+        "group 1's two leaves reprocessed (full subtree)"
+    );
+    let rigs = map.read_state(&state);
+    assert_eq!(rigs[&1].rig.leaves[&0].y, 144.0);
+    assert_eq!(rigs[&1].rig.leaves[&1].y, 9.0, "re-squared");
+    assert_eq!(rigs[&2].rig.leaves[&0].y, 16.0, "untouched group stays");
+}
+
+#[test]
+fn field_step_non_trigger_write_reprocesses_no_leaves() {
+    // Writing a port under the field that is not the trigger (the rig's
+    // name) through the field bridge must not reprocess any leaf.
+    let (mut graph, map, counter) = build_field_step();
+    let mut state = RigState::default();
+    graph.tick(&mut state, None);
+    assert_eq!(counter.get(), 3);
+
+    {
+        let mut r = graph.with_state(&mut state);
+        let rg = RigGroup::ports();
+        let rig = Rig::ports();
+        let mut g1 = map.get(&mut r, 1).unwrap();
+        let mut eref = g1.dagref();
+        rg.rig.with_field_ref(&mut eref, |fref| {
+            rig.name.write(fref, "renamed".to_string());
+        });
+    }
+
+    graph.tick(&mut state, None);
+    assert_eq!(counter.get(), 3, "name write reprocesses no leaves");
+    let rigs = map.read_state(&state);
+    assert_eq!(rigs[&1].rig.name, "renamed", "name updated in place");
+    assert_eq!(rigs[&1].rig.leaves[&0].y, 4.0, "leaf data untouched");
+    assert_eq!(rigs[&2].rig.leaves[&0].y, 16.0);
+}
+
+#[test]
+fn field_step_leaf_at_field_top() {
+    // The field itself is the leaf (path = FieldPath + LeafMarker): a
+    // widget-side write of a rig port through the field bridge reprocesses
+    // the field, and only that one.
+    let mut graph = Graph::new();
+    let counter = Rc::new(Cell::new(0usize));
+    let p = RigState::ports();
+    let map = p.rigs;
+
+    seed_rigs(&mut graph, map);
+
+    {
+        let c = counter.clone();
+        let rg = RigGroup::ports();
+        let rig = Rig::ports();
+        graph.add_map_tree_node(
+            map,
+            FieldPath {
+                field: rg.rig,
+                next: LeafMarker::new(),
+            },
+            rig.name.id(),
+            move |eref: &mut DagStructRef<Rig>, _gpu| {
+                c.set(c.get() + 1);
+                let n = rig.name.read(eref).clone();
+                rig.name.write(eref, format!("{n}!"));
+            },
+        );
+    }
+
+    let mut state = RigState::default();
+    graph.tick(&mut state, None);
+    assert_eq!(counter.get(), 2, "both rig fields processed once");
+
+    {
+        let mut r = graph.with_state(&mut state);
+        let rg = RigGroup::ports();
+        let rig = Rig::ports();
+        let mut g1 = map.get(&mut r, 1).unwrap();
+        let mut eref = g1.dagref();
+        rg.rig.with_field_ref(&mut eref, |fref| {
+            rig.name.write(fref, "main".to_string());
+        });
+    }
+
+    graph.tick(&mut state, None);
+    assert_eq!(counter.get(), 3, "only group 1's rig field reprocessed");
+    let rigs = map.read_state(&state);
+    assert_eq!(rigs[&1].rig.name, "main!", "bumped by the leaf eval");
+    assert_eq!(rigs[&2].rig.name, "!", "untouched group stays as-is");
 }
