@@ -372,20 +372,35 @@ impl InstanceArena {
         self.bind_group.as_ref()
     }
 
-    /// Builds the indirect draw args for the current slices, one per live
-    /// slice. `index_count` is the material's index buffer length.
-    pub(crate) fn args(&self, index_count: u32) -> Vec<wgpu::util::DrawIndexedIndirectArgs> {
+    /// Number of registered slots (including freed ones). Slots are stable
+    /// handles assigned at registration; freed slots are skipped when drawing.
+    pub(crate) fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// The slice currently stored at `slot`, if any (freed slots return `None`).
+    fn slice(&self, slot: u32) -> Option<&ArenaSlice> {
+        self.slots.get(slot as usize).and_then(|s| s.as_ref())
+    }
+
+    /// Indirect draw args for the given slots, in order (freed slots skipped).
+    pub(crate) fn args_for(
+        &self,
+        index_count: u32,
+        slots: &[u32],
+    ) -> Vec<wgpu::util::DrawIndexedIndirectArgs> {
         let wire_size = self.wire_size.max(1) as u32;
-        self.slots
+        slots
             .iter()
-            .filter_map(|s| {
-                s.map(|s| wgpu::util::DrawIndexedIndirectArgs {
-                    index_count,
-                    instance_count: s.instance_count,
-                    first_index: 0,
-                    base_vertex: 0,
-                    first_instance: s.offset / wire_size,
-                })
+            .filter_map(|&slot| {
+                self.slice(slot)
+                    .map(|s| wgpu::util::DrawIndexedIndirectArgs {
+                        index_count,
+                        instance_count: s.instance_count,
+                        first_index: 0,
+                        base_vertex: 0,
+                        first_instance: s.offset / wire_size,
+                    })
             })
             .collect()
     }
@@ -492,7 +507,7 @@ mod tests {
         assert_eq!(off1, 48);
         assert_eq!(arena.committed_size(), 64);
 
-        let args = arena.args(6);
+        let args = arena.args_for(6, &[0, 1]);
         assert_eq!(args.len(), 2);
         assert_eq!(args[0].first_instance, 0);
         assert_eq!(args[0].instance_count, 3);
@@ -517,7 +532,7 @@ mod tests {
         assert_eq!(off2, 0);
         assert_eq!(arena.committed_size(), 96); // no growth
 
-        let args = arena.args(6);
+        let args = arena.args_for(6, &[0, 1, 2]);
         assert_eq!(args.len(), 2); // s0 is gone; s1 + s2 remain
     }
 }

@@ -199,6 +199,45 @@ impl<K: Clone + Eq + std::hash::Hash + 'static, V: Clone + 'static, S> MapEntry<
         self.dirty = true;
         self.value
     }
+
+    /// Borrows the element through a [`DagStructRef`] that shares its
+    /// port-dirty set and nested map-dirty store with the graph — the
+    /// widget-side counterpart of the element refs map-node evals receive.
+    ///
+    /// Unlike [`MapEntry::read_mut`] — which marks the whole element `full`
+    /// on drop — the borrow itself marks nothing: only the ports used
+    /// through the returned ref record. `get`/`insert`/`remove` on a nested
+    /// map port record that inner key, so widget code can mutate one cell of
+    /// a nested map without reprocessing the element's whole subtree.
+    ///
+    /// The map port is marked dirty so the map nodes run on the next tick
+    /// and consume the per-key records (the records themselves live in the
+    /// element's shared nested store, which only a running node reads).
+    ///
+    /// ```ignore
+    /// let mut entry = layers.get(&mut r, "bg").unwrap();
+    /// let mut eref = entry.dagref();
+    /// cells.get(&mut eref, 3).read_mut().cpu_buffer.push(&rect);
+    /// ```
+    pub fn dagref(&mut self) -> DagStructRef<'_, V> {
+        self.dirty_set.borrow_mut().insert(self.port.id());
+        let mut store = self.map_dirty.borrow_mut();
+        let record = store
+            .entry(self.port.id())
+            .or_insert_with(|| Box::new(MapDirty::<K>::new()));
+        let record = record
+            .downcast_mut::<MapDirty<K>>()
+            .expect("map dirty record type mismatch");
+        let ed = record
+            .keys
+            .entry(self.key.clone())
+            .or_insert_with(ElemDirty::new);
+        let ports = ed.ports.clone();
+        let nested = ed.nested.clone();
+        drop(store);
+        let fired = Rc::new(RefCell::new(HashSet::new()));
+        DagStructRef::new_with(&mut *self.value, ports, fired, nested)
+    }
 }
 
 impl<K: Clone + Eq + std::hash::Hash + 'static, V: Clone + 'static, S> Drop

@@ -25,10 +25,10 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::window::Window;
 
 use crate::buffer_pool::BufferPool;
-use crate::canvas::{BatchedGroupSlot, Canvas, RenderSlot};
+use crate::canvas::{BatchedGroupSlot, Canvas, DrawBatch, RenderSlot};
 use crate::gpu;
 use crate::graph::write_source_fields;
-use crate::graph::{AppState, BuiltinState, DagStructRef, Graph, Port};
+use crate::graph::{AppState, BuiltinState, DagStructRef, Graph, Port, RenderPath};
 use crate::gui::Gui;
 use crate::gui::event::InputEvent;
 use crate::instance::GpuStruct;
@@ -45,6 +45,48 @@ fn push_bytes<PC: GpuStruct + crate::graph::PortValue, S: 'static>(
         let pc: &PC = constant.read_state(state);
         crate::bytemuck::bytes_of(pc).to_vec()
     })
+}
+
+/// Uploads one element's CPU instance buffer into the shared arena, writing
+/// back its [`GpuInstanceBuffer`] handle (or releasing it when the buffer is
+/// empty). Shared by the flat-map and render-tree batched registrations.
+fn upload_element<M: Material, R: 'static>(
+    arena: Rc<RefCell<InstanceArena>>,
+    cpu_buffer: Port<InstanceBuffer<M::Instance>, R>,
+    gpu_buffer: Port<Option<GpuInstanceBuffer>, R>,
+    gpu: Option<&sm::Gpu>,
+    eref: &mut DagStructRef<R>,
+) {
+    let Some(gpu) = gpu else { return };
+    let cpu: &InstanceBuffer<M::Instance> = cpu_buffer.read(eref);
+    let is_empty = cpu.is_empty();
+    let bytes = cpu.as_bytes().to_vec();
+    let count = cpu.instance_count();
+
+    if is_empty {
+        // Releasing the handle frees the element's GPU slice.
+        gpu_buffer.write(eref, None);
+        return;
+    }
+
+    let (slot, is_new) = match gpu_buffer.read(eref) {
+        Some(handle) => (handle.slot(), false),
+        None => (arena.borrow_mut().add_slot(), true),
+    };
+
+    let bytes_len = bytes.len().max(1) as u32;
+    {
+        let mut arena = arena.borrow_mut();
+        let offset = arena.alloc_for_slot(slot, count, bytes_len);
+        let needed = arena.committed_size();
+        arena.ensure_capacity(gpu, needed);
+        arena.upload(gpu, offset, if bytes.is_empty() { &[0u8] } else { &bytes });
+    }
+
+    if is_new {
+        let handle = GpuInstanceBuffer::new(arena.clone(), slot);
+        gpu_buffer.write(eref, Some(handle));
+    }
 }
 
 /// A windowed app with an optional GUI. Custom rendering is registered
@@ -271,10 +313,12 @@ impl<S: AppState> App<S> {
     {
         let wire_size = <M::Instance as GpuStruct>::wire_size();
         let arena = Rc::new(RefCell::new(InstanceArena::new(wire_size)));
+        let cpu_buffers: Vec<_> = cpu_buffers.into_iter().collect();
 
-        for cpu_p in cpu_buffers {
+        for cpu_p in &cpu_buffers {
             let slot = arena.borrow_mut().add_slot();
             let arena2 = arena.clone();
+            let cpu_p = *cpu_p;
             let mat_p = material;
             self.graph.add_node(
                 move |gref: &mut DagStructRef<S>, gpu: Option<&sm::Gpu>| {
@@ -306,6 +350,8 @@ impl<S: AppState> App<S> {
 
         let has_fb = M::HAS_FB_PUSH_CONSTANT;
         let mat_p = material;
+        let constant_p = constant;
+        let slot_count = cpu_buffers.len() as u32;
         self.pending_batched_groups.push(BatchedGroupSlot {
             arena,
             has_fb_in_push_constant: has_fb,
@@ -317,7 +363,12 @@ impl<S: AppState> App<S> {
                     .register_material(gpu, mat_p.read(state).clone())
                     .index
             })),
-            read_push_constant: push_bytes::<M::PushConstant, S>(constant),
+            read_batches: Box::new(move |state: &S| {
+                vec![DrawBatch {
+                    push_constant: push_bytes::<M::PushConstant, S>(constant_p)(state),
+                    slots: (0..slot_count).collect(),
+                }]
+            }),
         });
 
         self
@@ -367,41 +418,14 @@ impl<S: AppState> App<S> {
                   gpu: Option<&sm::Gpu>,
                   _k: &K,
                   eref: &mut DagStructRef<E>| {
-                let Some(gpu) = gpu else { return };
-                let cpu: &InstanceBuffer<M::Instance> = cpu_buffer.read(eref);
-                let is_empty = cpu.is_empty();
-                let bytes = cpu.as_bytes().to_vec();
-                let count = cpu.instance_count();
-
-                if is_empty {
-                    // Releasing the handle frees the element's GPU slice.
-                    gpu_buffer.write(eref, None);
-                    return;
-                }
-
-                let (slot, is_new) = match gpu_buffer.read(eref) {
-                    Some(handle) => (handle.slot(), false),
-                    None => (arena2.borrow_mut().add_slot(), true),
-                };
-
-                let bytes_len = bytes.len().max(1) as u32;
-                {
-                    let mut arena = arena2.borrow_mut();
-                    let offset = arena.alloc_for_slot(slot, count, bytes_len);
-                    let needed = arena.committed_size();
-                    arena.ensure_capacity(gpu, needed);
-                    arena.upload(gpu, offset, if bytes.is_empty() { &[0u8] } else { &bytes });
-                }
-
-                if is_new {
-                    let handle = GpuInstanceBuffer::new(arena2.clone(), slot);
-                    gpu_buffer.write(eref, Some(handle));
-                }
+                upload_element::<M, E>(arena2.clone(), cpu_buffer, gpu_buffer, gpu, eref);
             },
         );
 
         let has_fb = M::HAS_FB_PUSH_CONSTANT;
         let mat_p = material;
+        let constant_p = constant;
+        let arena_b = arena.clone();
         self.pending_batched_groups.push(BatchedGroupSlot {
             arena,
             has_fb_in_push_constant: has_fb,
@@ -413,7 +437,109 @@ impl<S: AppState> App<S> {
                     .register_material(gpu, mat_p.read(state).clone())
                     .index
             })),
-            read_push_constant: push_bytes::<M::PushConstant, S>(constant),
+            read_batches: Box::new(move |state: &S| {
+                vec![DrawBatch {
+                    push_constant: push_bytes::<M::PushConstant, S>(constant_p)(state),
+                    slots: (0..arena_b.borrow().slot_count() as u32).collect(),
+                }]
+            }),
+        });
+
+        self
+    }
+
+    /// Registers a **render tree**: a `HashMap` whose elements each provide a
+    /// push constant, with the instance data at the leaves of an arbitrarily
+    /// deep map hierarchy below them. One indirect draw batch per top-level
+    /// element — its constant, drawing the instances of every leaf in its
+    /// subtree — all in a single `multi_draw_indexed_indirect` per batch.
+    ///
+    /// - `material` — a `Port<M, S>` holding the material (shared pipeline).
+    /// - `top_map` — the top-level `Port<HashMap<K, E>, S>`.
+    /// - `constant` — a `Port<M::PushConstant, E>` on the top-level element.
+    /// - `path` — the descent from `E` to the leaves: one [`MapPath`] per
+    ///   map level, ending in [`LeafMarker`]. With a bare [`LeafMarker`] the
+    ///   top-level elements are the leaves (per-element constant + instance
+    ///   data in one map).
+    /// - `cpu_buffer` / `gpu_buffer` — the leaf's instance ports, with the
+    ///   same RAII semantics as [`Self::register_map_render_objects_batched`].
+    ///
+    /// Uploads are incremental at every depth: the recursive nested dirty
+    /// records drive exactly the changed subtrees (a fresh element — new
+    /// insert, overwrite, whole-element mutation — gets a full-subtree pass;
+    /// a removed element releases its slices via the [`GpuInstanceBuffer`]
+    /// handles automatically).
+    pub fn register_render_tree_batched<M, K, E, P>(
+        &mut self,
+        material: Port<M, S>,
+        top_map: Port<HashMap<K, E>, S>,
+        constant: Port<M::PushConstant, E>,
+        path: P,
+        cpu_buffer: Port<InstanceBuffer<M::Instance>, P::Leaf>,
+        gpu_buffer: Port<Option<GpuInstanceBuffer>, P::Leaf>,
+    ) -> &mut Self
+    where
+        M: Material,
+        K: Clone + Eq + std::hash::Hash + 'static,
+        E: Clone + 'static,
+        P: RenderPath<E>,
+        M::PushConstant: crate::graph::PortValue,
+    {
+        let wire_size = <M::Instance as GpuStruct>::wire_size();
+        let arena = Rc::new(RefCell::new(InstanceArena::new(wire_size)));
+        let arena2 = arena.clone();
+        let cpu_p = cpu_buffer;
+        let gpu_p = gpu_buffer;
+
+        // One flat DAG node for the whole tree: uploads changed leaf instance
+        // data into the shared arena. The cpu port doubles as the per-element
+        // re-trigger for leaf-at-top paths (chained stages writing it
+        // reprocess the element in the same tick).
+        let leaf_eval = move |eref: &mut DagStructRef<P::Leaf>, gpu: Option<&sm::Gpu>| {
+            upload_element::<M, P::Leaf>(arena2.clone(), cpu_p, gpu_p, gpu, eref);
+        };
+        self.graph
+            .add_map_tree_node(top_map, path.clone(), cpu_p.id(), leaf_eval);
+
+        // The batch list is derived from the state at render time: one batch
+        // per top-level element, covering the slots of every leaf in its
+        // subtree. Reading fresh each frame means constant changes and
+        // insert/remove of elements show up with zero DAG wiring.
+        let has_fb = M::HAS_FB_PUSH_CONSTANT;
+        let mat_p = material;
+        let top_map_p = top_map;
+        let constant_p = constant;
+        let gpu_leaf_p = gpu_p;
+        self.pending_batched_groups.push(BatchedGroupSlot {
+            arena,
+            has_fb_in_push_constant: has_fb,
+            material_slot: None,
+            register_material: Some(Box::new(move |canvas: &mut Canvas<S>, gpu, state| {
+                // Register the *current* material value from the state — a
+                // changed material port rebuilds the shared pipeline.
+                canvas
+                    .register_material(gpu, mat_p.read(state).clone())
+                    .index
+            })),
+            read_batches: Box::new(move |state: &S| {
+                let mut batches = Vec::new();
+                for e in top_map_p.read_state(state).values() {
+                    let mut slots = Vec::new();
+                    let mut leaf_collect = |leaf: &P::Leaf, out: &mut Vec<u32>| {
+                        if let Some(handle) = gpu_leaf_p.read_state(leaf) {
+                            out.push(handle.slot() as u32);
+                        }
+                    };
+                    path.collect(e, &mut slots, &mut leaf_collect);
+                    if !slots.is_empty() {
+                        batches.push(DrawBatch {
+                            push_constant: bytemuck::bytes_of(constant_p.read_state(e)).to_vec(),
+                            slots,
+                        });
+                    }
+                }
+                batches
+            }),
         });
 
         self

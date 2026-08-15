@@ -9,6 +9,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::marker::PhantomData;
 use std::rc::Rc;
 
 use shame_wgpu as sm;
@@ -397,6 +398,114 @@ impl<S: DagStruct> Graph<S> {
         let _ = elem_out;
     }
 
+    /// Registers a **render-tree** node over `map`: a single flat node that
+    /// descends an arbitrarily deep `HashMap` hierarchy via `path` — one
+    /// [`MapPath`] per map level, ending in [`LeafMarker`] — running `leaf`
+    /// once per bottom-level element that needs reprocessing.
+    ///
+    /// The graph stays flat (one node for the whole tree). Every level fans
+    /// out with the same record-driven dirty machinery as [`Graph::add_map_node`],
+    /// consuming the element's nested dirty records recursively, so only the
+    /// changed subtrees reprocess at any depth. A fresh element (new insert,
+    /// overwrite, whole-element mutation, whole-map write, or first run)
+    /// gets a full-subtree pass.
+    ///
+    /// - `path` — the descent from `map`'s element type `E` down to the
+    ///   leaves. `path.map_id()` drives the nested-record check: an element
+    ///   whose inner map was written by an earlier stage in the same tick
+    ///   reprocesses even when the element itself is not fresh.
+    /// - `trigger` — a leaf port id checked against each element's port-dirty
+    ///   set: at the top level it re-triggers an element a chained stage
+    ///   wrote (leaf-at-top paths pass the leaf read port, e.g. the cpu
+    ///   buffer); at the bottom level it is checked against each leaf's
+    ///   ports, so a leaf read-port write (chained stage or widget-side
+    ///   [`MapEntry::dagref`] access) reprocesses exactly that leaf.
+    /// - `leaf` — the bottom-level eval; receives the leaf element ref.
+    pub fn add_map_tree_node<K, E, P, F>(
+        &mut self,
+        map: Port<HashMap<K, E>, S>,
+        path: P,
+        trigger: PortId,
+        leaf: F,
+    ) where
+        K: Clone + Eq + std::hash::Hash + 'static,
+        E: Clone + 'static,
+        P: RenderPath<E>,
+        F: FnMut(&mut DagStructRef<P::Leaf>, Option<&sm::Gpu>) + 'static,
+    {
+        let map_id = map.id();
+        let path_map_id = path.map_id();
+        let mut started = false;
+        let mut leaf = leaf;
+
+        self.add_node(
+            move |gref: &mut DagStructRef<S>, gpu: Option<&sm::Gpu>| {
+                let md = gref.snapshot_map_dirty::<K>(map_id);
+                let full = !started || md.full;
+                started = true;
+
+                let (to_process, removed_keys): (Vec<(K, E)>, Vec<K>) = {
+                    let cur: &HashMap<K, E> = map.read(gref);
+                    let mut to_process = Vec::new();
+                    let mut removed_keys = Vec::new();
+                    if full {
+                        to_process.extend(cur.iter().map(|(k, v)| (k.clone(), v.clone())));
+                    } else {
+                        for (k, ed) in &md.keys {
+                            if !cur.contains_key(k) {
+                                if ed.removed {
+                                    removed_keys.push(k.clone());
+                                }
+                                continue;
+                            }
+                            if ed.added
+                                || ed.full
+                                || path_map_id
+                                    .is_some_and(|id| ed.nested.borrow().contains_key(&id))
+                                || ed.ports.borrow().contains(&trigger)
+                            {
+                                to_process.push((k.clone(), cur[k].clone()));
+                            }
+                        }
+                    }
+                    (to_process, removed_keys)
+                };
+
+                let mut wrote = false;
+                for (k, e) in to_process {
+                    let ports_rc = gref.ensure_elem_ports::<K>(map_id, k.clone());
+                    let nested = gref.ensure_elem_nested::<K>(map_id, k.clone());
+                    let mut e2 = e;
+                    {
+                        let fired = Rc::new(RefCell::new(HashSet::new()));
+                        let mut eref = DagStructRef::new_with(&mut e2, ports_rc, fired, nested);
+                        let fresh = full || md.keys.get(&k).map_or(false, |ed| ed.added || ed.full);
+                        path.descend(&mut eref, gpu, fresh, trigger, &mut leaf);
+                    }
+                    // Processed keys are always written back (like
+                    // `run_map_fanout`), so the map is marked dirty and
+                    // downstream readers re-run.
+                    map.read_mut_state(gref.inner_mut()).insert(k, e2);
+                    wrote = true;
+                }
+                if !removed_keys.is_empty() {
+                    wrote = true;
+                }
+                if wrote {
+                    gref.mark_dirty(map_id);
+                }
+            },
+            map,
+            map,
+            None,
+        );
+
+        // Tag this node as a map node over `map`, so topo sort can break
+        // map↔map cycles with chained stages over the same map (insertion
+        // order governs their run order).
+        self.nodes.last_mut().expect("just added a node").map_port = Some(map_id);
+    }
+
     /// Per-frame execution. Runs nodes whose input ports are dirty, in
     /// topological order. Dirty marks set by node writes propagate to later
     /// nodes within the same tick; fired conditions are reset at the end.
@@ -454,6 +563,211 @@ impl<S: DagStruct> Graph<S> {
 
         self.dirty.borrow_mut().clear();
         self.map_dirty.borrow_mut().clear();
+    }
+}
+
+/// The descent from a map's element type down to the leaves of a render tree.
+///
+/// Implemented by [`MapPath`] (one more map level) and [`LeafMarker`] (the
+/// bottom map's elements are the leaves). [`Graph::add_map_tree_node`] drives
+/// the whole path from one flat node: each level fans out over its map with
+/// the same record-driven dirty machinery as [`Graph::add_map_node`], so only
+/// changed subtrees reprocess at any depth.
+pub trait RenderPath<T>: Clone + 'static {
+    /// The bottom element type — what the leaf eval runs on.
+    type Leaf: Clone + 'static;
+
+    /// `Some(map id)` when this path starts with a map level. The parent
+    /// level checks an element's nested dirty record against this id, so an
+    /// element whose inner map was written by an earlier stage in the same
+    /// tick reprocesses even when the element itself is not fresh.
+    fn map_id(&self) -> Option<PortId>;
+
+    /// Fans out over this path's subtree below `gref`, running `leaf` once
+    /// per changed bottom-level element. `full` forces a full-subtree pass
+    /// (fresh element, whole-map write, or first run). `trigger` is the leaf
+    /// read port id: at the bottom level, an element whose ports contain it
+    /// (a chained stage or widget-side [`MapEntry::dagref`] write) is
+    /// reprocessed even when the element itself is not fresh. Returns true
+    /// when any element was written back.
+    fn descend(
+        &self,
+        gref: &mut DagStructRef<T>,
+        gpu: Option<&sm::Gpu>,
+        full: bool,
+        trigger: PortId,
+        leaf: &mut impl FnMut(&mut DagStructRef<Self::Leaf>, Option<&sm::Gpu>),
+    ) -> bool;
+
+    /// Walks `e`'s subtree, calling `leaf_collect` on every leaf element
+    /// (used to gather the leaf GPU slots that form one draw batch).
+    fn collect(
+        &self,
+        e: &T,
+        out: &mut Vec<u32>,
+        leaf_collect: &mut impl FnMut(&Self::Leaf, &mut Vec<u32>),
+    );
+}
+
+/// One map level of a [`RenderPath`]: `map` is a field of the parent element
+/// type `T`, and `next` describes the descent from its elements.
+pub struct MapPath<T, K, E, P: RenderPath<E>>
+where
+    T: 'static,
+    K: Clone + Eq + std::hash::Hash + 'static,
+    E: Clone + 'static,
+{
+    pub map: Port<HashMap<K, E>, T>,
+    pub next: P,
+}
+
+// `Port` is Copy, so only the next level needs cloning.
+impl<
+    T: 'static,
+    K: Clone + Eq + std::hash::Hash + 'static,
+    E: Clone + 'static,
+    P: RenderPath<E> + Clone,
+> Clone for MapPath<T, K, E, P>
+{
+    fn clone(&self) -> Self {
+        Self {
+            map: self.map,
+            next: self.next.clone(),
+        }
+    }
+}
+
+impl<T: 'static, K, E, P: RenderPath<E>> RenderPath<T> for MapPath<T, K, E, P>
+where
+    K: Clone + Eq + std::hash::Hash + 'static,
+    E: Clone + 'static,
+{
+    type Leaf = P::Leaf;
+
+    fn map_id(&self) -> Option<PortId> {
+        Some(self.map.id())
+    }
+
+    fn descend(
+        &self,
+        gref: &mut DagStructRef<T>,
+        gpu: Option<&sm::Gpu>,
+        full: bool,
+        trigger: PortId,
+        leaf: &mut impl FnMut(&mut DagStructRef<Self::Leaf>, Option<&sm::Gpu>),
+    ) -> bool {
+        // One fan-out level — the same record-driven decision as
+        // `run_map_fanout`, plus the nested-record check: an element whose
+        // inner map was written by an earlier stage in this tick reprocesses
+        // even when the element itself is not fresh. At the bottom level the
+        // trigger port is checked against the element's ports set, so a leaf
+        // read-port write (chained stage, or widget-side `dagref` access)
+        // reprocesses exactly that leaf.
+        let md = gref.snapshot_map_dirty::<K>(self.map.id());
+        let full = full || md.full;
+        let next_map_id = self.next.map_id();
+        let bottom = next_map_id.is_none();
+
+        let (to_process, removed_keys): (Vec<(K, E)>, Vec<K>) = {
+            let cur: &HashMap<K, E> = self.map.read(gref);
+            let mut to_process = Vec::new();
+            let mut removed_keys = Vec::new();
+            if full {
+                to_process.extend(cur.iter().map(|(k, v)| (k.clone(), v.clone())));
+            } else {
+                for (k, ed) in &md.keys {
+                    if !cur.contains_key(k) {
+                        if ed.removed {
+                            removed_keys.push(k.clone());
+                        }
+                        continue;
+                    }
+                    if ed.added
+                        || ed.full
+                        || next_map_id.is_some_and(|id| ed.nested.borrow().contains_key(&id))
+                        || (bottom && ed.ports.borrow().contains(&trigger))
+                    {
+                        to_process.push((k.clone(), cur[k].clone()));
+                    }
+                }
+            }
+            (to_process, removed_keys)
+        };
+
+        let mut wrote = false;
+        for (k, e) in to_process {
+            let ports_rc = gref.ensure_elem_ports::<K>(self.map.id(), k.clone());
+            let nested = gref.ensure_elem_nested::<K>(self.map.id(), k.clone());
+            let mut e2 = e;
+            {
+                let fired = Rc::new(RefCell::new(HashSet::new()));
+                let mut eref = DagStructRef::new_with(&mut e2, ports_rc, fired, nested);
+                let fresh = full || md.keys.get(&k).map_or(false, |ed| ed.added || ed.full);
+                self.next.descend(&mut eref, gpu, fresh, trigger, leaf);
+            }
+            // Processed keys are always written back (like `run_map_fanout`),
+            // so the parent map is marked dirty and downstream readers re-run.
+            self.map.read_mut_state(gref.inner_mut()).insert(k, e2);
+            wrote = true;
+        }
+        if !removed_keys.is_empty() {
+            wrote = true;
+        }
+        if wrote {
+            gref.mark_dirty(self.map.id());
+        }
+        wrote
+    }
+
+    fn collect(
+        &self,
+        e: &T,
+        out: &mut Vec<u32>,
+        leaf_collect: &mut impl FnMut(&Self::Leaf, &mut Vec<u32>),
+    ) {
+        for el in self.map.read_state(e).values() {
+            self.next.collect(el, out, leaf_collect);
+        }
+    }
+}
+
+/// The end of a [`RenderPath`]: the bottom map's elements are the leaves —
+/// the leaf eval runs directly on them.
+#[derive(Clone, Copy, Default)]
+pub struct LeafMarker<L>(PhantomData<fn() -> L>);
+
+impl<L> LeafMarker<L> {
+    pub fn new() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<L: Clone + 'static> RenderPath<L> for LeafMarker<L> {
+    type Leaf = L;
+
+    fn map_id(&self) -> Option<PortId> {
+        None
+    }
+
+    fn descend(
+        &self,
+        gref: &mut DagStructRef<L>,
+        gpu: Option<&sm::Gpu>,
+        _full: bool,
+        _trigger: PortId,
+        leaf: &mut impl FnMut(&mut DagStructRef<Self::Leaf>, Option<&sm::Gpu>),
+    ) -> bool {
+        leaf(gref, gpu);
+        true
+    }
+
+    fn collect(
+        &self,
+        e: &L,
+        out: &mut Vec<u32>,
+        leaf_collect: &mut impl FnMut(&Self::Leaf, &mut Vec<u32>),
+    ) {
+        leaf_collect(e, out);
     }
 }
 

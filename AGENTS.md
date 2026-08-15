@@ -32,6 +32,7 @@
 - `crates/shame-gui/tests/common/mod.rs` — `compare_snapshot`/`compare_snapshot_frame2` (both generic over `S: AppState + DagStruct`).
 - `crates/shame-gui/examples/calc.rs` — reference: `#[state]` + `#[derive(DagStruct, Widget)]` state, `Self::ports()`, `add_node`, `into_viewport_nodes()`.
 - `crates/shame-gui/examples/dynamic_map.rs` + `tests/dynamic_map.rs` — **reference for `add_map_node`** (dynamic HashMap fan-out).
+- `crates/shame-gui/examples/render_tree.rs` + `tests/snapshot_tree_batched_indirect.rs` + `tests/nested_tree.rs` — **reference for `register_render_tree_batched` / `add_map_tree_node`** (arbitrary-depth render trees).
 - `crates/shame-gui/examples/click_rects.rs` + `tests/click_rects.rs` — condition/event DAG.
 
 ## Commands (PowerShell, from repo root)
@@ -108,6 +109,7 @@
 - `Graph::new()` — no args (source/render ports come from `S::source_ports()`/`render_ports()`).
 - `graph.add_node(eval, inputs, outputs, condition)` — `eval: FnMut(&mut DagStructRef<S>, Option<&sm::Gpu>)`. `inputs`/`outputs: impl PortGroup<S>`; `condition: Option<Port<bool, S>>` makes it event-driven.
 - `graph.add_map_node(map, global_in, global_out, elem_in, elem_out, eval)` — dynamic fan-out (below).
+- `graph.add_map_tree_node(map, path, trigger, leaf)` — **arbitrary-depth** fan-out over a map hierarchy (below).
 - `graph.with_state(&mut state) -> DagStructRef<S>` — wraps the state, routing writes into the graph's dirty/fired sets (used by `App` to write source fields, and by the GUI render walk).
 - `Graph::tick(&mut self, state: &mut S, gpu: Option<&sm::Gpu>)` — runs dirty/condition/new nodes in topo order, then resets fired conditions.
 
@@ -132,7 +134,18 @@ graph.add_map_node(
 
 - The node keeps a private `known_keys: HashSet<K>` and **diffs structurally** against the map each tick (plus per-key dirty records via `snapshot_map_dirty`/`ensure_elem_ports`), so **only changed keys are reprocessed**. Removed keys are dropped from the output.
 - `E: Clone + 'static` (no `PartialEq` needed). The eval clones each changed element, wraps it in a `DagStructRef<E>` that **shares the element's port dirty set**, runs the closure, and writes the result back. `global_in`/`global_out`/`elem_in`/`elem_out` are separate parameters because `S` and `E` are different types.
+- **Widget-side per-key access — `MapEntry::dagref()`**: widget code (holding `&mut DagStructRef<S>`, no map-node eval) borrows one element through a `DagStructRef<V>` that **shares the element's port set and nested map-dirty store with the graph**. The borrow itself marks nothing (unlike `read_mut`, which marks the whole element `full` on drop); only the ports used through it record — so `inner_map.get/insert/remove` on a nested map port records that inner key and the tree reprocesses **exactly that cell**, not the whole layer subtree. Marks the map port dirty so the nodes run. Chain one `dagref` per level to reach arbitrary depth. Reference: `tests/nested_tree.rs` (`widget_side_*` tests).
 - Reference: `examples/dynamic_map.rs` + `tests/dynamic_map.rs`.
+
+### Arbitrary-depth fan-out — `Graph::add_map_tree_node` + `RenderPath`
+
+One **flat** node descends a `HashMap` hierarchy of any depth: the path type (`RenderPath<E>`; `MapPath { map, next }` per map level, `LeafMarker<L>` at the bottom) is `Clone`, and the node's eval fans out level by level through the recursive nested dirty records (`ElemDirty.nested`), so only changed subtrees reprocess. The leaf eval `FnMut(&mut DagStructRef<P::Leaf>, Option<&Gpu>)` runs per changed bottom element.
+
+- Fresh element (insert / overwrite / whole-element mutation / whole-map write / first run) → **full-subtree pass**; the freshness flag threads down every level.
+- `trigger: PortId` — a leaf port id checked against each element's port-dirty set: at the top level it re-triggers an element a chained stage wrote (leaf-at-top paths pass the leaf read port, e.g. `cpu_buffer`); at the bottom level it is checked against each leaf's ports, so a leaf read-port write (chained stage or widget-side `MapEntry::dagref` access) reprocesses exactly that leaf.
+- Per-level filter also checks the element's nested record against the child's map id (same-tick inner-map writes by earlier stages).
+- The node tags itself as a map node over the top map (map↔map cycle breaking, insertion order governs).
+- Reference: `tests/nested_tree.rs` (depth 1/2/3 + chained stages + widget-side per-cell writes).
 
 **Widget → DAG bridge:** widgets write through `DagStructRef` (`Port::write`), auto-marking ports dirty; the graph re-runs nodes reading them on the next tick. No manual `mark_dirty` wiring.
 
@@ -140,11 +153,14 @@ graph.add_map_node(
 
 ## Batched render objects (indirect draw)
 
-Both batched paths funnel into one shared `InstanceArena` (grow-only storage buffer + free-list + indirect args buffer) and issue **one `multi_draw_indexed_indirect` per group**. Canvas builds the bind group (no DAG bind node). `gpu.rs` requires `Features::INDIRECT_FIRST_INSTANCE`.
+All batched paths funnel into one shared `InstanceArena` (grow-only storage buffer + free-list + indirect args buffer) per group. Canvas builds the bind group (no DAG bind node). `gpu.rs` requires `Features::INDIRECT_FIRST_INSTANCE`.
+
+A `BatchedGroupSlot` is **(arena, material, batches)** — `read_batches: Box<dyn Fn(&S) -> Vec<DrawBatch>>` read from the state at render time. A `DrawBatch` is a push constant + the arena slots drawn with it; the canvas builds the args buffer **in batch order** and issues **one `multi_draw_indexed_indirect` per batch**. Static/flat registrations produce a single batch (one dispatch, as before); a render tree produces one batch per top-level element.
 
 - `register_render_objects_batched<M>(material, constant, cpu_buffers)` — **static**: a fixed list of `Port<InstanceBuffer<M::Instance>, S>`; one upload `add_node` per object into its own arena slot. Reference: `tests/snapshot_batched_indirect.rs`.
 - `register_map_render_objects_batched<M,K,E>(map, material, constant, cpu_buffer, gpu_buffer)` — **dynamic**: `HashMap<K,E>` where each element carries `cpu_buffer: InstanceBuffer<M::Instance>` (user-filled) + `gpu_buffer: Option<GpuInstanceBuffer>` (framework-written). One `add_map_node` uploads per changed key; `GpuInstanceBuffer` is RAII (`Rc` + `Drop` → `free_slot`), so removing a key releases its slice automatically — **no reconcile node**. Reference: `examples/dynamic_map_gpu.rs` + `tests/snapshot_map_batched_indirect.rs`.
-- One draw = one bind group + one push constant: batch only objects/elements sharing the same material value and identical push-constant bytes. `ViewportParams` implements `PortValue`, so the built-in `RectMaterial`/`WireframeMaterial` work in both batched APIs.
+- `register_render_tree_batched<M,K,E,P>(material, top_map, constant, path, cpu_buffer, gpu_buffer)` — **render tree**: the top map's elements each provide `constant: Port<M::PushConstant, E>`; the leaves of the `path` hierarchy provide the instance ports. One indirect dispatch per top-level element (its constant + every leaf's slots in its subtree). Built on `add_map_tree_node` (upload per changed leaf) + a render-time batch walk (`RenderPath::collect`); the batch list is derived from the state each frame, so constant changes and insert/remove show up with zero DAG wiring. `P::Leaf` types the leaf ports, so the same call covers 1-level (bare `LeafMarker`) to N-level (nested `MapPath`) trees. Reference: `examples/render_tree.rs` + `tests/snapshot_tree_batched_indirect.rs` (per-group tint constants verified by pixel assertions).
+- One draw = one bind group + one push constant per batch: batch only objects/elements sharing the same material value; push constants may vary per batch. `ViewportParams` implements `PortValue`, so the built-in `RectMaterial`/`WireframeMaterial` work in the static/flat APIs.
 
 ## ViewportRect — custom widget rendering (`gui/primitives/viewport_rect.rs`)
 

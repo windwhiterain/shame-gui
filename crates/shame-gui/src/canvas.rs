@@ -46,9 +46,20 @@ pub(crate) struct RenderSlot<S> {
     pub(crate) read_push_constant: Box<dyn Fn(&S) -> Vec<u8>>,
 }
 
-/// A batched render-object group: one shared [`InstanceArena`] + one material +
-/// one push constant. Each `register_render_object_batched` object is an arena
-/// slice; the canvas issues one `multi_draw_indexed_indirect` per group.
+/// One draw batch inside a [`BatchedGroupSlot`]: a push constant plus the
+/// arena slots drawn with it. The canvas builds the indirect args in batch
+/// order (one contiguous range per batch) and issues one
+/// `multi_draw_indexed_indirect` per batch with the batch's push constant.
+#[allow(dead_code)]
+pub(crate) struct DrawBatch {
+    pub(crate) push_constant: Vec<u8>,
+    pub(crate) slots: Vec<u32>,
+}
+
+/// A batched render-object group: one shared [`InstanceArena`] + one material
+/// + a list of draw batches (each with its own push constant). Every batch is
+/// one `multi_draw_indexed_indirect`; the static/flat registrations produce a
+/// single batch, a render tree produces one batch per top-level element.
 #[allow(dead_code)]
 pub(crate) struct BatchedGroupSlot<S> {
     pub(crate) arena: Rc<RefCell<InstanceArena>>,
@@ -57,7 +68,8 @@ pub(crate) struct BatchedGroupSlot<S> {
     /// Re-run every frame — see [`RenderSlot::register_material`].
     pub(crate) register_material:
         Option<Box<dyn Fn(&mut Canvas<S>, &sm::Gpu, &DagStructRef<S>) -> usize>>,
-    pub(crate) read_push_constant: Box<dyn Fn(&S) -> Vec<u8>>,
+    /// The per-frame draw batches, read from the state at render time.
+    pub(crate) read_batches: Box<dyn Fn(&S) -> Vec<DrawBatch>>,
 }
 
 /// Per-frame push constant batch for the fast path (widget fills/outlines).
@@ -454,6 +466,7 @@ impl<S> Canvas<S> {
                     .and_then(|mi| self.slots[mi].blend.is_some().then_some(true))
                     .unwrap_or(false)
             });
+            let args_stride = size_of::<wgpu::util::DrawIndexedIndirectArgs>() as u64;
             for &gi in &sorted_bg {
                 let group = &self.batched_groups[gi];
                 let Some(mat_idx) = group.material_slot else {
@@ -461,22 +474,28 @@ impl<S> Canvas<S> {
                 };
                 let mat = &self.slots[mat_idx];
 
-                let mut push_bytes = (group.read_push_constant)(state.inner());
-                if group.has_fb_in_push_constant && push_bytes.len() >= 8 {
-                    push_bytes[..8].copy_from_slice(bytemuck::bytes_of(&fb));
-                }
-                check_immediate_size(&push_bytes);
-
+                let batches = (group.read_batches)(state.inner());
                 let index_count = match &mat.draw {
                     Draw::Primitive { indices } => indices.len() as u32,
                 };
 
+                // Build the args buffer in batch order; each batch gets a
+                // contiguous (start, count) range so one indirect dispatch
+                // with the batch's push constant draws exactly its slots.
                 let mut arena = group.arena.borrow_mut();
                 let needed = arena.committed_size();
                 arena.ensure_capacity(gpu, needed);
                 arena.ensure_bind_group(gpu, &mat.bindings);
                 let bind_group = arena.bind_group().cloned();
-                let args = arena.args(index_count);
+                let mut args: Vec<wgpu::util::DrawIndexedIndirectArgs> = Vec::new();
+                let mut ranges: Vec<(u32, u32)> = Vec::new();
+                for batch in &batches {
+                    let start = args.len() as u32;
+                    args.extend(arena.args_for(index_count, &batch.slots));
+                    if args.len() as u32 > start {
+                        ranges.push((start, args.len() as u32 - start));
+                    }
+                }
                 let args_buffer = arena.write_args(gpu, &args).cloned();
                 drop(arena);
 
@@ -487,13 +506,25 @@ impl<S> Canvas<S> {
                     continue;
                 };
 
-                pass.set_pipeline(&mat.pipeline);
-                pass.set_bind_group(0, &bind_group, &[]);
-                pass.set_index_buffer(mat.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                if !push_bytes.is_empty() {
-                    pass.set_immediates(0, &push_bytes);
+                for ((start, count), batch) in ranges.iter().zip(batches.iter()) {
+                    let mut push_bytes = batch.push_constant.clone();
+                    if group.has_fb_in_push_constant && push_bytes.len() >= 8 {
+                        push_bytes[..8].copy_from_slice(bytemuck::bytes_of(&fb));
+                    }
+                    check_immediate_size(&push_bytes);
+
+                    pass.set_pipeline(&mat.pipeline);
+                    pass.set_bind_group(0, &bind_group, &[]);
+                    pass.set_index_buffer(mat.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    if !push_bytes.is_empty() {
+                        pass.set_immediates(0, &push_bytes);
+                    }
+                    pass.multi_draw_indexed_indirect(
+                        &args_buffer,
+                        *start as u64 * args_stride,
+                        *count,
+                    );
                 }
-                pass.multi_draw_indexed_indirect(&args_buffer, 0, args.len() as u32);
             }
         }
     }
