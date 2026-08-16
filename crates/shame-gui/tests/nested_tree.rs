@@ -1154,7 +1154,11 @@ fn tree_node_processes_elements_in_place() {
 
     let mut state = CloneState::default();
     graph.tick(&mut state, None);
-    assert_eq!(leaf_counter.get(), 5, "first tick: full pass over all leaves");
+    assert_eq!(
+        leaf_counter.get(),
+        5,
+        "first tick: full pass over all leaves"
+    );
     assert_eq!(
         group_clones.load(Ordering::Relaxed),
         0,
@@ -1166,7 +1170,10 @@ fn tree_node_processes_elements_in_place() {
         "full pass processes in place, no leaf clone"
     );
     let groups = map.read_state(&state);
-    assert_eq!(groups[&1].leaves[&1].y, 9.0, "leaf eval ran on live elements");
+    assert_eq!(
+        groups[&1].leaves[&1].y, 9.0,
+        "leaf eval ran on live elements"
+    );
 
     // Widget-side per-cell write (the paint-event path): write one leaf's `x`
     // through tracked refs.

@@ -492,7 +492,9 @@ impl<S: DagStruct> Graph<S> {
                 // dirty — the same marks the old write-back produced, minus
                 // the clone and the write-back.
                 for k in &keys {
-                    let Some(mut entry) = map.get(gref, k.clone()) else { continue };
+                    let Some(mut entry) = map.get(gref, k.clone()) else {
+                        continue;
+                    };
                     let mut eref = entry.dagref();
                     let fresh = full || md.keys.get(k).map_or(false, |ed| ed.added || ed.full);
                     path.descend(&mut eref, gpu, fresh, trigger, &mut leaf);
@@ -706,7 +708,9 @@ where
         };
 
         for k in &keys {
-            let Some(mut entry) = self.map.get(gref, k.clone()) else { continue };
+            let Some(mut entry) = self.map.get(gref, k.clone()) else {
+                continue;
+            };
             let mut eref = entry.dagref();
             let fresh = full || md.keys.get(k).map_or(false, |ed| ed.added || ed.full);
             self.next.descend(&mut eref, gpu, fresh, trigger, leaf);

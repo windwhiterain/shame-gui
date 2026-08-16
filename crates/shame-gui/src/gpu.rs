@@ -29,15 +29,7 @@ pub struct Setup {
 impl Setup {
     /// Initializes the GPU stack for a window. Panics on failure.
     pub fn new(window: &Arc<Window>) -> Self {
-        let instance = wgpu::Instance::default();
-        let surface = instance
-            .create_surface(Arc::clone(window))
-            .expect("failed to create surface for window");
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            compatible_surface: Some(&surface),
-            ..Default::default()
-        }))
-        .expect("no GPU adapter compatible with this window/surface");
+        let (instance, surface, adapter) = Self::request_adapter(window);
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: None,
             // IMMEDIATES: shame push constants; INDIRECT_FIRST_INSTANCE:
@@ -73,6 +65,64 @@ impl Setup {
         let size: winit::dpi::PhysicalSize<u32> = window.inner_size();
         setup.resize(size.width, size.height);
         setup
+    }
+
+    /// Creates the instance, surface, and adapter for a window.
+    ///
+    /// On Windows, Vulkan is tried first: enumerating DX12 with a
+    /// virtual-display driver installed (remote-desktop IDD adapters) can
+    /// take seconds per backend, and surface-compatibility filtering can
+    /// then leave only WARP, whose `max_immediate_size` is below the
+    /// framework's required 256 bytes. Vulkan probing is fast on the same
+    /// machines. Falls back to DX12 when Vulkan yields no adapter; panics
+    /// when neither does.
+    fn request_adapter(
+        window: &Arc<Window>,
+    ) -> (wgpu::Instance, wgpu::Surface<'static>, wgpu::Adapter) {
+        #[cfg(windows)]
+        {
+            for backends in [wgpu::Backends::VULKAN, wgpu::Backends::DX12] {
+                if let Some(requested) = Self::request_with_backends(window, backends) {
+                    return requested;
+                }
+            }
+            panic!(
+                "no GPU adapter compatible with this window/surface (Vulkan and DX12 both unavailable)"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            let instance = wgpu::Instance::default();
+            let surface = instance
+                .create_surface(Arc::clone(window))
+                .expect("failed to create surface for window");
+            let adapter =
+                pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                    compatible_surface: Some(&surface),
+                    ..Default::default()
+                }))
+                .expect("no GPU adapter compatible with this window/surface");
+            (instance, surface, adapter)
+        }
+    }
+
+    /// Requests an adapter from one backend; `None` when the backend has no
+    /// adapter compatible with the window's surface (try the next backend).
+    #[cfg(windows)]
+    fn request_with_backends(
+        window: &Arc<Window>,
+        backends: wgpu::Backends,
+    ) -> Option<(wgpu::Instance, wgpu::Surface<'static>, wgpu::Adapter)> {
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        desc.backends = backends;
+        let instance = wgpu::Instance::new(desc);
+        let surface = instance.create_surface(Arc::clone(window)).ok()?;
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            compatible_surface: Some(&surface),
+            ..Default::default()
+        }))
+        .ok()?;
+        Some((instance, surface, adapter))
     }
 
     /// Reconfigures the surface for a new window size (physical pixels).
