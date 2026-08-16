@@ -1805,11 +1805,14 @@ dependencies = [
  "glyphon",
  "image",
  "pollster",
+ "raw-window-handle",
  "shame",
  "shame_gui_derive",
  "shame_wgpu",
+ "sys-locale",
  "taffy",
  "wgpu",
+ "windows-sys 0.52.0",
  "winit",
 ]
 

@@ -181,6 +181,7 @@ fn render_tree_scene() -> App<TreeState> {
         },
         el.cpu_buffer,
         el.gpu_buffer,
+        None,
     );
 
     app

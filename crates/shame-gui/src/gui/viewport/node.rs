@@ -18,7 +18,11 @@ pub enum SplitDir {
 }
 
 /// A user-resizable split: two children divided by a draggable divider line.
-/// `ratio` is the first child's share of the extent (0.0–1.0).
+/// `ratio` is the first child's share of the extent (0.0–1.0). The effective
+/// ratio is clamped per frame to the range the children's taffy minimums
+/// allow (see [`split_ratio_range`](crate::gui::viewport::layout::split_ratio_range)),
+/// so a default ratio that leaves a pane below its min size is auto-adjusted
+/// without mutating the stored value.
 ///
 /// Construct via [`ViewportNode::split`].
 pub struct SplitNode<S> {

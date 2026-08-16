@@ -15,6 +15,7 @@ use shame_gui::graph::Graph;
 use shame_gui::graph::LeafMarker;
 use shame_gui::graph::MapPath;
 use shame_gui::graph::Port;
+use shame_gui::graph::PortId;
 use shame_gui::state;
 
 /// The bottom element: `x` is the input, `y` the computed output.
@@ -992,4 +993,211 @@ fn field_step_leaf_at_field_top() {
     let rigs = map.read_state(&state);
     assert_eq!(rigs[&1].rig.name, "main!", "bumped by the leaf eval");
     assert_eq!(rigs[&2].rig.name, "!", "untouched group stays as-is");
+}
+
+// ── In-place processing: no element clones ──────────────────────────────
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// A leaf that counts its own clones (all leaves share the counter via `Arc`).
+#[derive(Default, Debug)]
+pub struct CloneLeaf {
+    pub x: f32,
+    pub y: f32,
+    pub clones: Arc<AtomicUsize>,
+}
+
+impl Clone for CloneLeaf {
+    fn clone(&self) -> Self {
+        self.clones.fetch_add(1, Ordering::Relaxed);
+        Self {
+            x: self.x,
+            y: self.y,
+            clones: self.clones.clone(),
+        }
+    }
+}
+
+/// Top element of a 2-level tree; also counts its clones.
+#[derive(Default, Debug)]
+pub struct CloneGroup {
+    pub leaves: HashMap<u32, CloneLeaf>,
+    pub clones: Arc<AtomicUsize>,
+}
+
+impl Clone for CloneGroup {
+    fn clone(&self) -> Self {
+        self.clones.fetch_add(1, Ordering::Relaxed);
+        Self {
+            leaves: self.leaves.clone(),
+            clones: self.clones.clone(),
+        }
+    }
+}
+
+/// App state for the clone-counting tree.
+#[state]
+#[derive(Clone, Default, DagStruct)]
+pub struct CloneState {
+    pub groups: HashMap<u32, CloneGroup>,
+}
+
+fn clone_group_ports() -> Port<HashMap<u32, CloneLeaf>, CloneGroup> {
+    Port::new(
+        PortId::new(0),
+        |g: &CloneGroup| &g.leaves,
+        |g: &mut CloneGroup, v| g.leaves = v,
+        |g: &mut CloneGroup| &mut g.leaves,
+    )
+}
+
+fn clone_leaf_ports() -> (Port<f32, CloneLeaf>, Port<f32, CloneLeaf>) {
+    (
+        Port::new(
+            PortId::new(0),
+            |l: &CloneLeaf| &l.x,
+            |l: &mut CloneLeaf, v| l.x = v,
+            |l: &mut CloneLeaf| &mut l.x,
+        ),
+        Port::new(
+            PortId::new(1),
+            |l: &CloneLeaf| &l.y,
+            |l: &mut CloneLeaf, v| l.y = v,
+            |l: &mut CloneLeaf| &mut l.y,
+        ),
+    )
+}
+
+#[test]
+fn tree_node_processes_elements_in_place() {
+    // The tree node must never clone a top element or a leaf element: on a
+    // per-cell write (the shame-paint paint-event path) the old clone +
+    // write-back implementation deep-cloned the whole top element — O(document)
+    // — and the leaf map level cloned each touched leaf. In-place processing
+    // makes both zero.
+    let mut graph = Graph::new();
+    let leaf_counter = Rc::new(Cell::new(0usize));
+    let group_clones = Arc::new(AtomicUsize::new(0));
+    let leaf_clones = Arc::new(AtomicUsize::new(0));
+    let p = CloneState::ports();
+    let map = p.groups;
+
+    // Seed two groups (3 + 2 leaves) — writes move the values, no clones.
+    {
+        let m = map;
+        let gc = group_clones.clone();
+        let lc = leaf_clones.clone();
+        graph.add_node(
+            move |gref: &mut DagStructRef<CloneState>, _gpu| {
+                if m.read(gref).is_empty() {
+                    let mut g1 = CloneGroup {
+                        leaves: HashMap::new(),
+                        clones: gc.clone(),
+                    };
+                    for (i, x) in [2.0f32, 3.0, 4.0].iter().enumerate() {
+                        g1.leaves.insert(
+                            i as u32,
+                            CloneLeaf {
+                                x: *x,
+                                y: 0.0,
+                                clones: lc.clone(),
+                            },
+                        );
+                    }
+                    let mut g2 = CloneGroup {
+                        leaves: HashMap::new(),
+                        clones: gc.clone(),
+                    };
+                    for (i, x) in [5.0f32, 6.0].iter().enumerate() {
+                        g2.leaves.insert(
+                            i as u32,
+                            CloneLeaf {
+                                x: *x,
+                                y: 0.0,
+                                clones: lc.clone(),
+                            },
+                        );
+                    }
+                    let mut cur = HashMap::new();
+                    cur.insert(1, g1);
+                    cur.insert(2, g2);
+                    m.write(gref, cur);
+                }
+            },
+            (),
+            map,
+            None,
+        );
+    }
+
+    // Tree node: square `x` into `y` per leaf, the shame-paint shape
+    // (top map → leaf map).
+    {
+        let c = leaf_counter.clone();
+        let leaves = clone_group_ports();
+        let (x, y) = clone_leaf_ports();
+        graph.add_map_tree_node(
+            map,
+            MapPath {
+                map: leaves,
+                next: LeafMarker::new(),
+            },
+            x.id(),
+            move |eref: &mut DagStructRef<CloneLeaf>, _gpu| {
+                c.set(c.get() + 1);
+                let xv = *x.read(eref);
+                y.write(eref, xv * xv);
+            },
+        );
+    }
+
+    let mut state = CloneState::default();
+    graph.tick(&mut state, None);
+    assert_eq!(leaf_counter.get(), 5, "first tick: full pass over all leaves");
+    assert_eq!(
+        group_clones.load(Ordering::Relaxed),
+        0,
+        "full pass processes in place, no top-element clone"
+    );
+    assert_eq!(
+        leaf_clones.load(Ordering::Relaxed),
+        0,
+        "full pass processes in place, no leaf clone"
+    );
+    let groups = map.read_state(&state);
+    assert_eq!(groups[&1].leaves[&1].y, 9.0, "leaf eval ran on live elements");
+
+    // Widget-side per-cell write (the paint-event path): write one leaf's `x`
+    // through tracked refs.
+    {
+        let mut r = graph.with_state(&mut state);
+        let leaves = clone_group_ports();
+        let (x, _y) = clone_leaf_ports();
+        let mut g1 = map.get(&mut r, 1).unwrap();
+        let mut eref = g1.dagref();
+        let mut l1 = leaves.get(&mut eref, 2).unwrap();
+        let mut eref2 = l1.dagref();
+        x.write(&mut eref2, 10.0);
+    }
+
+    graph.tick(&mut state, None);
+    assert_eq!(leaf_counter.get(), 6, "only leaf 2 of group 1 reprocessed");
+    assert_eq!(
+        group_clones.load(Ordering::Relaxed),
+        0,
+        "per-cell event never clones the top element"
+    );
+    assert_eq!(
+        leaf_clones.load(Ordering::Relaxed),
+        0,
+        "per-cell event never clones the leaf element"
+    );
+    let groups = map.read_state(&state);
+    assert_eq!(
+        groups[&1].leaves[&2].y, 100.0,
+        "leaf eval wrote into the live element"
+    );
+    assert_eq!(groups[&1].leaves[&0].y, 4.0, "sibling leaf untouched");
+    assert_eq!(groups[&2].leaves[&0].y, 25.0, "other group untouched");
 }

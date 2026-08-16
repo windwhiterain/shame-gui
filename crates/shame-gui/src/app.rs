@@ -14,6 +14,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::num::NonZero;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -21,7 +22,7 @@ use std::time::Instant;
 
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::window::Window;
 
 use crate::buffer_pool::BufferPool;
@@ -60,8 +61,6 @@ fn upload_element<M: Material, R: 'static>(
     let Some(gpu) = gpu else { return };
     let cpu: &InstanceBuffer<M::Instance> = cpu_buffer.read(eref);
     let is_empty = cpu.is_empty();
-    let bytes = cpu.as_bytes().to_vec();
-    let count = cpu.instance_count();
 
     if is_empty {
         // Releasing the handle frees the element's GPU slice.
@@ -74,19 +73,46 @@ fn upload_element<M: Material, R: 'static>(
         None => (arena.borrow_mut().add_slot(), true),
     };
 
-    let bytes_len = bytes.len().max(1) as u32;
-    {
+    // Upload only the dirty tail (the buffer's watermark) — or the full
+    // buffer when the slice moved — then clear the watermark by writing the
+    // buffer back, so the next append uploads just its own tail.
+    let uploaded = {
         let mut arena = arena.borrow_mut();
-        let offset = arena.alloc_for_slot(slot, count, bytes_len);
-        let needed = arena.committed_size();
-        arena.ensure_capacity(gpu, needed);
-        arena.upload(gpu, offset, if bytes.is_empty() { &[0u8] } else { &bytes });
+        let (_, uploaded) = arena.sync_slice(gpu, slot, cpu);
+        uploaded
+    };
+    if uploaded {
+        let mut clean = cpu.clone();
+        clean.clear_dirty();
+        cpu_buffer.write(eref, clean);
     }
 
     if is_new {
         let handle = GpuInstanceBuffer::new(arena.clone(), slot);
         gpu_buffer.write(eref, Some(handle));
     }
+}
+
+/// The instance-data half of a render tree registered with
+/// [`App::register_render_tree_upload`]: the shared [`InstanceArena`] plus
+/// everything the draw-time batch walk needs to find each element's leaf
+/// slices. Attach one or more draw batches with
+/// [`App::register_render_tree_batch_slot`].
+///
+/// Cloning the handle attaches several batch slots to the same uploaded tree
+/// (e.g. multi-pass draws sharing one set of instance data).
+#[derive(Clone)]
+pub struct RenderTreeHandle<S, M, K, E, P>
+where
+    K: Clone + Eq + std::hash::Hash + 'static,
+    E: Clone + 'static,
+    P: RenderPath<E>,
+{
+    arena: Rc<RefCell<InstanceArena>>,
+    top_map: Port<HashMap<K, E>, S>,
+    path: P,
+    gpu_buffer: Port<Option<GpuInstanceBuffer>, P::Leaf>,
+    _marker: PhantomData<fn(M)>,
 }
 
 /// A windowed app with an optional GUI. Custom rendering is registered
@@ -324,23 +350,22 @@ impl<S: AppState> App<S> {
                 move |gref: &mut DagStructRef<S>, gpu: Option<&sm::Gpu>| {
                     let Some(gpu) = gpu else { return };
                     let cpu: &InstanceBuffer<M::Instance> = cpu_p.read(gref);
-                    let (is_empty, bytes, count) = (
-                        cpu.is_empty(),
-                        cpu.as_bytes().to_vec(),
-                        cpu.instance_count(),
-                    );
+                    let is_empty = cpu.is_empty();
                     let mut arena = arena2.borrow_mut();
                     if is_empty {
                         arena.free_slot(slot);
                         return;
                     }
-                    let bytes_len = bytes.len().max(1) as u32;
-                    let offset = arena.alloc_for_slot(slot, count, bytes_len);
-                    // Grow the arena buffer *before* writing, so `upload` never
-                    // targets an offset past the current buffer's end.
-                    let needed = arena.committed_size();
-                    arena.ensure_capacity(gpu, needed);
-                    arena.upload(gpu, offset, if bytes.is_empty() { &[0u8] } else { &bytes });
+                    // Upload only the dirty tail (or the full buffer when the
+                    // slice moved), then clear the watermark by writing the
+                    // buffer back.
+                    let (_, uploaded) = arena.sync_slice(gpu, slot, cpu);
+                    drop(arena);
+                    if uploaded {
+                        let mut clean = cpu.clone();
+                        clean.clear_dirty();
+                        cpu_p.write(gref, clean);
+                    }
                 },
                 (cpu_p, mat_p),
                 (),
@@ -448,15 +473,14 @@ impl<S: AppState> App<S> {
         self
     }
 
-    /// Registers a **render tree**: a `HashMap` whose elements each provide a
-    /// push constant, with the instance data at the leaves of an arbitrarily
-    /// deep map hierarchy below them. One indirect draw batch per top-level
-    /// element — its constant, drawing the instances of every leaf in its
-    /// subtree — all in a single `multi_draw_indexed_indirect` per batch.
+    /// Registers the **instance-upload half** of a render tree: a `HashMap`
+    /// whose elements hold the instance data at the leaves of an arbitrarily
+    /// deep map hierarchy below them. One DAG node uploads changed leaf
+    /// buffers into a shared [`InstanceArena`]; the returned
+    /// [`RenderTreeHandle`] is attached to a draw batch with
+    /// [`Self::register_render_tree_batch_slot`].
     ///
-    /// - `material` — a `Port<M, S>` holding the material (shared pipeline).
     /// - `top_map` — the top-level `Port<HashMap<K, E>, S>`.
-    /// - `constant` — a `Port<M::PushConstant, E>` on the top-level element.
     /// - `path` — the descent from `E` to the leaves: one [`MapPath`] per
     ///   map level, ending in [`LeafMarker`]. With a bare [`LeafMarker`] the
     ///   top-level elements are the leaves (per-element constant + instance
@@ -469,21 +493,23 @@ impl<S: AppState> App<S> {
     /// insert, overwrite, whole-element mutation — gets a full-subtree pass;
     /// a removed element releases its slices via the [`GpuInstanceBuffer`]
     /// handles automatically).
-    pub fn register_render_tree_batched<M, K, E, P>(
+    ///
+    /// The upload is deliberately split from the draw: the batch slot reads a
+    /// `Port<M::PushConstant, E>` from each live element at draw time, so the
+    /// constant may be composed by any DAG node from any inputs — the
+    /// framework never sees how it is produced.
+    pub fn register_render_tree_upload<M, K, E, P>(
         &mut self,
-        material: Port<M, S>,
         top_map: Port<HashMap<K, E>, S>,
-        constant: Port<M::PushConstant, E>,
         path: P,
         cpu_buffer: Port<InstanceBuffer<M::Instance>, P::Leaf>,
         gpu_buffer: Port<Option<GpuInstanceBuffer>, P::Leaf>,
-    ) -> &mut Self
+    ) -> RenderTreeHandle<S, M, K, E, P>
     where
         M: Material,
         K: Clone + Eq + std::hash::Hash + 'static,
         E: Clone + 'static,
         P: RenderPath<E>,
-        M::PushConstant: crate::graph::PortValue,
     {
         let wire_size = <M::Instance as GpuStruct>::wire_size();
         let arena = Rc::new(RefCell::new(InstanceArena::new(wire_size)));
@@ -501,6 +527,61 @@ impl<S: AppState> App<S> {
         self.graph
             .add_map_tree_node(top_map, path.clone(), cpu_p.id(), leaf_eval);
 
+        RenderTreeHandle {
+            arena,
+            top_map,
+            path,
+            gpu_buffer: gpu_p,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Attaches a **draw batch** to a render tree uploaded with
+    /// [`Self::register_render_tree_upload`]: one indirect draw per top-level
+    /// element — the element's own push constant, drawing the slots of every
+    /// leaf in its subtree — all in a single `multi_draw_indexed_indirect`
+    /// per batch, sharing the tree's [`InstanceArena`].
+    ///
+    /// - `material` — a `Port<M, S>` holding the material (shared pipeline).
+    /// - `constant` — a `Port<M::PushConstant, E>` on the top-level element,
+    ///   read from the **live** element at draw time. The constant is just a
+    ///   port: any DAG node may compose it from any inputs (camera, element
+    ///   fields, animated state, ...) and any condition may gate it — the
+    ///   framework never sees how it is produced.
+    /// - `visible` — an optional per-leaf visibility port, read from the
+    ///   **live** leaf at batch-build time: leaves whose port reads `false`
+    ///   are skipped, so a DAG node (or widget code) can cull off-screen
+    ///   leaves from the draw with zero upload/reprocess cost — the leaf's
+    ///   instance data stays uploaded in the arena, and the flag is
+    ///   non-destructive (`None` means "always draw", the previous behavior).
+    ///
+    /// The batch list is derived from the state each frame, so constant
+    /// changes and insert/remove of elements show up with zero DAG wiring.
+    /// Cloning the handle from [`Self::register_render_tree_upload`] and
+    /// calling this again attaches further batches over the same instance
+    /// data.
+    pub fn register_render_tree_batch_slot<M, K, E, P>(
+        &mut self,
+        tree: RenderTreeHandle<S, M, K, E, P>,
+        material: Port<M, S>,
+        constant: Port<M::PushConstant, E>,
+        visible: Option<Port<bool, P::Leaf>>,
+    ) -> &mut Self
+    where
+        M: Material,
+        K: Clone + Eq + std::hash::Hash + 'static,
+        E: Clone + 'static,
+        P: RenderPath<E>,
+        M::PushConstant: crate::graph::PortValue,
+    {
+        let RenderTreeHandle {
+            arena,
+            top_map,
+            path,
+            gpu_buffer,
+            ..
+        } = tree;
+
         // The batch list is derived from the state at render time: one batch
         // per top-level element, covering the slots of every leaf in its
         // subtree. Reading fresh each frame means constant changes and
@@ -509,7 +590,8 @@ impl<S: AppState> App<S> {
         let mat_p = material;
         let top_map_p = top_map;
         let constant_p = constant;
-        let gpu_leaf_p = gpu_p;
+        let gpu_leaf_p = gpu_buffer;
+        let visible_p = visible;
         self.pending_batched_groups.push(BatchedGroupSlot {
             arena,
             has_fb_in_push_constant: has_fb,
@@ -526,6 +608,12 @@ impl<S: AppState> App<S> {
                 for e in top_map_p.read_state(state).values() {
                     let mut slots = Vec::new();
                     let mut leaf_collect = |leaf: &P::Leaf, out: &mut Vec<u32>| {
+                        // Live per-leaf culling: a leaf flagged not visible is
+                        // skipped from the draw (its arena slice is untouched,
+                        // so it shows up again as soon as the flag flips back).
+                        if visible_p.is_some_and(|vp| !vp.read_state(leaf)) {
+                            return;
+                        }
                         if let Some(handle) = gpu_leaf_p.read_state(leaf) {
                             out.push(handle.slot() as u32);
                         }
@@ -543,6 +631,50 @@ impl<S: AppState> App<S> {
         });
 
         self
+    }
+
+    /// Registers a **render tree**: a `HashMap` whose elements each provide a
+    /// push constant, with the instance data at the leaves of an arbitrarily
+    /// deep map hierarchy below them. One indirect draw batch per top-level
+    /// element — its constant, drawing the instances of every leaf in its
+    /// subtree — all in a single `multi_draw_indexed_indirect` per batch.
+    ///
+    /// Convenience form of [`Self::register_render_tree_upload`] followed by
+    /// [`Self::register_render_tree_batch_slot`]; split the two calls when
+    /// the constant port is composed by your own DAG node or when several
+    /// batches share one uploaded tree.
+    ///
+    /// - `material` — a `Port<M, S>` holding the material (shared pipeline).
+    /// - `top_map` — the top-level `Port<HashMap<K, E>, S>`.
+    /// - `constant` — a `Port<M::PushConstant, E>` on the top-level element.
+    /// - `path` — the descent from `E` to the leaves: one [`MapPath`] per
+    ///   map level, ending in [`LeafMarker`]. With a bare [`LeafMarker`] the
+    ///   top-level elements are the leaves (per-element constant + instance
+    ///   data in one map).
+    /// - `cpu_buffer` / `gpu_buffer` — the leaf's instance ports, with the
+    ///   same RAII semantics as [`Self::register_map_render_objects_batched`].
+    /// - `visible` — optional per-leaf visibility port (see
+    ///   [`Self::register_render_tree_batch_slot`]); `None` draws every leaf
+    ///   with uploaded instance data.
+    pub fn register_render_tree_batched<M, K, E, P>(
+        &mut self,
+        material: Port<M, S>,
+        top_map: Port<HashMap<K, E>, S>,
+        constant: Port<M::PushConstant, E>,
+        path: P,
+        cpu_buffer: Port<InstanceBuffer<M::Instance>, P::Leaf>,
+        gpu_buffer: Port<Option<GpuInstanceBuffer>, P::Leaf>,
+        visible: Option<Port<bool, P::Leaf>>,
+    ) -> &mut Self
+    where
+        M: Material,
+        K: Clone + Eq + std::hash::Hash + 'static,
+        E: Clone + 'static,
+        P: RenderPath<E>,
+        M::PushConstant: crate::graph::PortValue,
+    {
+        let tree = self.register_render_tree_upload(top_map, path, cpu_buffer, gpu_buffer);
+        self.register_render_tree_batch_slot(tree, material, constant, visible)
     }
 
     /// Sets the clear color of the window background (wgpu linear-space RGBA).
@@ -686,6 +818,8 @@ impl<S: AppState> App<S> {
             scroll_delta: 0.0,
             pending_render_slots,
             pending_batched_groups,
+            pen_proxy: Some(event_loop.create_proxy()),
+            pending_events: Vec::new(),
         };
         event_loop.run_app(&mut app).unwrap();
     }
@@ -709,6 +843,13 @@ struct FrameApp<S: AppState> {
     pending_render_slots: Vec<RenderSlot<S>>,
     pending_batched_groups: Vec<BatchedGroupSlot<S>>,
     runner: Option<Box<dyn crate::capture::AppRunner<S>>>,
+    /// Proxy used by the WM_POINTER pen interceptor (Windows) to wake the
+    /// event loop after queueing [`PenInput`](crate::pen::PenInput) events.
+    /// `None` on other platforms.
+    pen_proxy: Option<EventLoopProxy<()>>,
+    /// Events emitted by the runner's `after_tick` hook, fed to the GUI at
+    /// the start of the next redraw (mirrors `App::step`).
+    pending_events: Vec<InputEvent>,
 }
 
 impl<S: AppState> FrameApp<S> {
@@ -737,19 +878,25 @@ impl<S: AppState> FrameApp<S> {
         }
 
         // after_tick runs even when the graph is inactive — mirrors `App::step`.
-        if let Some(ref mut runner) = self.runner {
+        let emitted = if let Some(ref mut runner) = self.runner {
             let ctx = crate::capture::AppContext {
                 state: &self.state,
                 graph: &self.graph,
                 gui: self.gui.as_ref(),
             };
-            runner.after_tick(&ctx);
-        }
+            runner.after_tick(&ctx)
+        } else {
+            vec![]
+        };
+        self.pending_events = emitted;
     }
 
     fn handle_input(&mut self, event: &WindowEvent) {
         if let WindowEvent::CursorMoved { position, .. } = event {
             self.cursor = Vec2::new(position.x as f32, position.y as f32);
+        }
+        if let WindowEvent::Touch(touch) = event {
+            self.cursor = Vec2::new(touch.location.x as f32, touch.location.y as f32);
         }
         match event {
             WindowEvent::MouseInput { state, .. } => {
@@ -768,6 +915,7 @@ impl<S: AppState> FrameApp<S> {
             WindowEvent::CursorMoved { .. }
             | WindowEvent::MouseInput { .. }
             | WindowEvent::MouseWheel { .. }
+            | WindowEvent::Touch { .. }
             | WindowEvent::KeyboardInput { .. } => {
                 if let Some(gui) = &mut self.gui {
                     if let Some(input) = InputEvent::from_winit(event, self.cursor) {
@@ -801,12 +949,44 @@ impl<S: AppState> FrameApp<S> {
         // `sm::Gpu` is an Arc clone of device + queue, so the DAG can borrow
         // a private copy — no raw pointer into `gpu_setup`.
         let gpu = self.gpu_setup.as_ref().unwrap().gpu.clone();
+
+        // Runner-injected events (the previous tick's `after_tick` return)
+        // are fed to the GUI before this frame's DAG tick — mirrors
+        // `App::step`.
+        let pending: Vec<InputEvent> = self.pending_events.drain(..).collect();
+        if !pending.is_empty() {
+            for ev in &pending {
+                if let Some(pos) = crate::gui::event::event_pos(ev) {
+                    self.cursor = pos;
+                }
+                match ev {
+                    InputEvent::MouseDown { .. } => self.mouse_down = true,
+                    InputEvent::MouseUp { .. } => self.mouse_down = false,
+                    _ => {}
+                }
+            }
+            if let Some(gui) = &mut self.gui {
+                let mut dagref = self.graph.with_state(&mut self.state);
+                let fb_size = self.canvas.as_ref().unwrap().framebuffer_size();
+                for input in &pending {
+                    gui.on_event(input, fb_size, &mut dagref);
+                }
+            }
+        }
+
         self.tick_dag(Some(&gpu));
 
         let window = Arc::clone(self.window.as_ref().unwrap());
         let gpu_setup = self.gpu_setup.as_mut().unwrap();
         let canvas = self.canvas.as_mut().unwrap();
-        let (surface_texture, view) = gpu_setup.try_acquire_surface();
+        let Some((surface_texture, view)) = gpu_setup.try_acquire_surface() else {
+            // Window occluded/minimized or the surface is temporarily
+            // unavailable: skip this frame's rendering (the DAG has already
+            // ticked above) and retry on the next redraw instead of blocking
+            // the UI thread or panicking.
+            window.request_redraw();
+            return;
+        };
 
         canvas.clear();
 
@@ -952,6 +1132,21 @@ impl<S: AppState> ApplicationHandler for FrameApp<S> {
                 )
                 .unwrap(),
         );
+        #[cfg(windows)]
+        {
+            use crate::pen::imp::install;
+            use raw_window_handle::HasWindowHandle;
+            // Intercept WM_POINTER on the new window so pen input carries
+            // pressure (see `pen.rs`). Must run before any pen contact.
+            let proxy = self.pen_proxy.as_ref().unwrap().clone();
+            let hwnd = match window.window_handle().unwrap().as_raw() {
+                raw_window_handle::RawWindowHandle::Win32(h) => {
+                    h.hwnd.get() as *mut std::ffi::c_void as windows_sys::Win32::Foundation::HWND
+                }
+                _ => unreachable!("winit windows window must be a Win32 window"),
+            };
+            install(hwnd, proxy);
+        }
         let gpu_setup = gpu::Setup::new(&window);
         let mut canvas = Canvas::new();
         canvas.set_clear_color(self.clear_color);
@@ -968,6 +1163,19 @@ impl<S: AppState> ApplicationHandler for FrameApp<S> {
         self.canvas = Some(canvas);
     }
 
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
+        let events = crate::pen::take_events();
+        for event in events {
+            if let Some(gui) = &mut self.gui {
+                let input = crate::pen::to_input(event);
+                let size = self.window.as_ref().unwrap().inner_size();
+                let mut dagref = self.graph.with_state(&mut self.state);
+                gui.on_event(&input, Vec2u::new(size.width, size.height), &mut dagref);
+                self.window.as_ref().unwrap().request_redraw();
+            }
+        }
+    }
+
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -978,6 +1186,7 @@ impl<S: AppState> ApplicationHandler for FrameApp<S> {
             WindowEvent::CursorMoved { .. }
             | WindowEvent::MouseInput { .. }
             | WindowEvent::MouseWheel { .. }
+            | WindowEvent::Touch { .. }
             | WindowEvent::KeyboardInput { .. }
             | WindowEvent::CursorLeft { .. } => {
                 self.handle_input(&event);

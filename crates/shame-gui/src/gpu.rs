@@ -88,41 +88,37 @@ impl Setup {
         &self.surface_config
     }
 
-    /// Acquires the next surface texture and a view over it, retrying on
-    /// transient failures and reconfiguring on lost/outdated surfaces.
-    fn try_acquire_surface_texture(&self) -> wgpu::SurfaceTexture {
-        let mut attempts = 0;
-        loop {
-            match self.surface.get_current_texture() {
-                wgpu::CurrentSurfaceTexture::Success(texture)
-                | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => return texture,
-                wgpu::CurrentSurfaceTexture::Timeout => {}
-                wgpu::CurrentSurfaceTexture::Outdated
-                | wgpu::CurrentSurfaceTexture::Lost
-                | wgpu::CurrentSurfaceTexture::Occluded
-                | wgpu::CurrentSurfaceTexture::Validation => {
-                    self.surface.configure(&self.gpu, &self.surface_config);
-                }
+    /// Acquires the next surface texture and a view over it, or `None` when
+    /// the surface is temporarily unavailable (window occluded/minimized, a
+    /// transient timeout, or a lost/outdated surface that was just
+    /// reconfigured). Never blocks or retries on the caller's thread: the
+    /// caller skips the frame and retries on the next redraw.
+    fn try_acquire_surface_texture(&self) -> Option<wgpu::SurfaceTexture> {
+        match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(texture)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => Some(texture),
+            wgpu::CurrentSurfaceTexture::Timeout => None,
+            wgpu::CurrentSurfaceTexture::Outdated
+            | wgpu::CurrentSurfaceTexture::Lost
+            | wgpu::CurrentSurfaceTexture::Occluded
+            | wgpu::CurrentSurfaceTexture::Validation => {
+                self.surface.configure(&self.gpu, &self.surface_config);
+                None
             }
-            attempts += 1;
-            if attempts >= 100 {
-                panic!("surface acquire failed after {attempts} retries");
-            }
-            // Yield to the compositor instead of busy-spinning (an occluded
-            // window can keep returning `Occluded`/`Timeout` for many frames).
-            std::thread::sleep(std::time::Duration::from_millis(8));
         }
     }
 
-    /// Acquires the next surface texture and a view over it.
-    pub fn try_acquire_surface(&self) -> (wgpu::SurfaceTexture, wgpu::TextureView) {
-        let surface_texture = self.try_acquire_surface_texture();
+    /// Acquires the next surface texture and a view over it, or `None` when
+    /// the surface is temporarily unavailable (see
+    /// [`Self::try_acquire_surface_texture`]).
+    pub fn try_acquire_surface(&self) -> Option<(wgpu::SurfaceTexture, wgpu::TextureView)> {
+        let surface_texture = self.try_acquire_surface_texture()?;
         let view = surface_texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor {
                 format: Some(self.surface_config.format),
                 ..Default::default()
             });
-        (surface_texture, view)
+        Some((surface_texture, view))
     }
 }

@@ -79,6 +79,7 @@ pub mod gui;
 pub mod instance;
 pub mod material;
 pub mod math;
+mod pen;
 pub mod prelude;
 pub mod rect;
 pub mod shader;

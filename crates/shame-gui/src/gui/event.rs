@@ -139,12 +139,50 @@ pub fn event_pos(event: &InputEvent) -> Option<Vec2> {
 impl InputEvent {
     /// Converts a winit window event. `cursor` is the last known cursor
     /// position (winit's mouse-button events carry no position).
+    ///
+    /// Stylus/tablet and touch-screen input arrives as winit `Touch` events
+    /// (on Windows this is the WM_POINTER path: winit already normalizes pen
+    /// pressure to 0.0–1.0 in `force`). It is surfaced as mouse events with
+    /// `pressure` set, so widgets that ignore pressure work unchanged and
+    /// painting code can treat `pressure == Some(p)` as "a pen/touch stroke".
     pub(crate) fn from_winit(
         event: &winit::event::WindowEvent,
         cursor: Vec2,
     ) -> Option<InputEvent> {
-        use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
+        use winit::event::{ElementState, Force, MouseScrollDelta, TouchPhase, WindowEvent};
         match event {
+            WindowEvent::Touch(touch) => {
+                let pressure = match touch.force {
+                    Some(Force::Normalized(force)) => Some(force.clamp(0.0, 1.0) as f32),
+                    Some(Force::Calibrated {
+                        force,
+                        max_possible_force,
+                        ..
+                    }) => {
+                        let ratio = if max_possible_force > 0.0 {
+                            force / max_possible_force
+                        } else {
+                            0.0
+                        };
+                        Some(ratio.clamp(0.0, 1.0) as f32)
+                    }
+                    None => None,
+                };
+                let pos = Vec2::new(touch.location.x as f32, touch.location.y as f32);
+                match touch.phase {
+                    TouchPhase::Started => Some(InputEvent::MouseDown {
+                        pos,
+                        button: MouseButton::Left,
+                        pressure,
+                    }),
+                    TouchPhase::Moved => Some(InputEvent::MouseMove { pos, pressure }),
+                    TouchPhase::Ended | TouchPhase::Cancelled => Some(InputEvent::MouseUp {
+                        pos,
+                        button: MouseButton::Left,
+                        pressure,
+                    }),
+                }
+            }
             WindowEvent::CursorMoved { position, .. } => Some(InputEvent::MouseMove {
                 pos: Vec2::new(position.x as f32, position.y as f32),
                 pressure: None,
@@ -214,5 +252,82 @@ impl InputEvent {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use winit::event::{DeviceId, Force, Touch, TouchPhase, WindowEvent};
+
+    fn touch(phase: TouchPhase, force: Option<Force>) -> InputEvent {
+        InputEvent::from_winit(
+            &WindowEvent::Touch(Touch {
+                device_id: DeviceId::dummy(),
+                phase,
+                location: (320.0, 240.0).into(),
+                id: 1,
+                force,
+            }),
+            Vec2::new(0.0, 0.0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn pen_down_carries_normalized_pressure() {
+        let event = touch(TouchPhase::Started, Some(Force::Normalized(0.5)));
+        assert_eq!(
+            event,
+            InputEvent::MouseDown {
+                pos: Vec2::new(320.0, 240.0),
+                button: MouseButton::Left,
+                pressure: Some(0.5),
+            }
+        );
+    }
+
+    #[test]
+    fn pen_move_carries_calibrated_pressure() {
+        let event = touch(
+            TouchPhase::Moved,
+            Some(Force::Calibrated {
+                force: 2.0,
+                max_possible_force: 4.0,
+                altitude_angle: None,
+            }),
+        );
+        assert_eq!(
+            event,
+            InputEvent::MouseMove {
+                pos: Vec2::new(320.0, 240.0),
+                pressure: Some(0.5),
+            }
+        );
+    }
+
+    #[test]
+    fn pen_up_and_cancel_map_to_mouse_up() {
+        for phase in [TouchPhase::Ended, TouchPhase::Cancelled] {
+            assert_eq!(
+                touch(phase, Some(Force::Normalized(0.0))),
+                InputEvent::MouseUp {
+                    pos: Vec2::new(320.0, 240.0),
+                    button: MouseButton::Left,
+                    pressure: Some(0.0),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn touch_without_force_has_no_pressure() {
+        assert_eq!(
+            touch(TouchPhase::Moved, None),
+            InputEvent::MouseMove {
+                pos: Vec2::new(320.0, 240.0),
+                pressure: None,
+            }
+        );
     }
 }

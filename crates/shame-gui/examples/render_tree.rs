@@ -186,6 +186,7 @@ fn main() {
         },
         el.cpu_buffer,
         el.gpu_buffer,
+        None,
     );
 
     app.run(TextSystem::new());

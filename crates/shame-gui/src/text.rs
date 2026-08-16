@@ -104,13 +104,70 @@ struct TextGpu {
 impl TextSystem {
     /// Creates a text system. `measure()` is available immediately;
     /// GPU resources are lazily initialized on the first render frame.
+    ///
+    /// On Windows only the system UI font and the font-linking set are
+    /// loaded — the same fonts GDI/DirectWrite resolve to for GUI text
+    /// (Segoe UI, the CJK UI fonts, emoji/symbol, Consolas). Scanning every
+    /// font in `%SystemRoot%\Fonts` (hundreds of files on CJK systems) is
+    /// replaced by parsing a handful of files, cutting construction from
+    /// tens-to-hundreds of ms to single-digit ms. Other platforms keep the
+    /// full system scan (Linux goes through fontconfig, which already loads
+    /// only the user-configured fonts and aliases).
     pub fn new() -> Self {
         Self {
-            font_system: cosmic_text::FontSystem::new(),
+            font_system: Self::system_font_system(),
             swash_cache: cosmic_text::SwashCache::new(),
             gpu: None,
             objects: Vec::new(),
         }
+    }
+
+    /// Windows font-linking set: `(file, family)`. A family only becomes a
+    /// generic default when its file actually loaded.
+    #[cfg(windows)]
+    const SYSTEM_FONT_CANDIDATES: &[(&str, &str)] = &[
+        ("segoeui.ttf", "Segoe UI"),           // Latin UI + default sans
+        ("msyh.ttc", "Microsoft YaHei UI"),    // zh-Hans
+        ("msjh.ttc", "Microsoft JhengHei UI"), // zh-Hant
+        ("YuGothM.ttc", "Yu Gothic"),          // ja
+        ("malgun.ttf", "Malgun Gothic"),       // ko
+        ("seguiemj.ttf", "Segoe UI Emoji"),
+        ("seguisym.ttf", "Segoe UI Symbol"),
+        ("consola.ttf", "Consolas"), // monospace
+    ];
+
+    #[cfg(windows)]
+    fn system_font_system() -> cosmic_text::FontSystem {
+        let mut db = cosmic_text::fontdb::Database::new();
+        let root = std::env::var_os("SYSTEMROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+        let dir = root.join("Fonts");
+
+        let mut loaded: Vec<&str> = Vec::new();
+        for (file, family) in Self::SYSTEM_FONT_CANDIDATES {
+            if db.load_font_file(dir.join(file)).is_ok() {
+                loaded.push(family);
+            }
+        }
+        if loaded.is_empty() {
+            // No candidate found (fonts relocated?) — full system scan so
+            // text still renders.
+            return cosmic_text::FontSystem::new();
+        }
+        // fontdb's generic-family defaults (Arial) are not loaded here;
+        // point the defaults at the loaded UI font, matching the OS.
+        db.set_sans_serif_family(loaded[0]);
+        if loaded.contains(&"Consolas") {
+            db.set_monospace_family("Consolas");
+        }
+        let locale = sys_locale::get_locale().unwrap_or_else(|| "en-US".into());
+        cosmic_text::FontSystem::new_with_locale_and_db(locale, db)
+    }
+
+    #[cfg(not(windows))]
+    fn system_font_system() -> cosmic_text::FontSystem {
+        cosmic_text::FontSystem::new()
     }
 
     /// Creates a text system from embedded font data (no system font

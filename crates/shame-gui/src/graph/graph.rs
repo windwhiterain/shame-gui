@@ -411,6 +411,15 @@ impl<S: DagStruct> Graph<S> {
     /// overwrite, whole-element mutation, whole-map write, or first run)
     /// gets a full-subtree pass.
     ///
+    /// Unlike [`Graph::add_map_node`] — whose eval receives a cloned element
+    /// and a write-back — the tree node processes changed elements **in
+    /// place**: it borrows each element from the map through the same
+    /// [`MapEntry`] path widget code uses, so a per-cell write costs no
+    /// element clone and no write-back at any level of the path. The leaf
+    /// eval's writes land directly in the live element, and the map port is
+    /// marked dirty (per processed key, and when keys were removed) so
+    /// downstream readers re-run.
+    ///
     /// - `path` — the descent from `map`'s element type `E` down to the
     ///   leaves. `path.map_id()` drives the nested-record check: an element
     ///   whose inner map was written by an earlier stage in the same tick
@@ -445,12 +454,17 @@ impl<S: DagStruct> Graph<S> {
                 let full = !started || md.full;
                 started = true;
 
-                let (to_process, removed_keys): (Vec<(K, E)>, Vec<K>) = {
+                // Decide which keys to process — keys only, never element
+                // clones: the elements are mutated **in place** below, so the
+                // whole-element clone + write-back is gone from the per-event
+                // path (a paint event used to deep-clone the whole layer and
+                // drop it again, O(document), even though one cell changed).
+                let (keys, removed_keys): (Vec<K>, Vec<K>) = {
                     let cur: &HashMap<K, E> = map.read(gref);
-                    let mut to_process = Vec::new();
+                    let mut keys = Vec::new();
                     let mut removed_keys = Vec::new();
                     if full {
-                        to_process.extend(cur.iter().map(|(k, v)| (k.clone(), v.clone())));
+                        keys.extend(cur.keys().cloned());
                     } else {
                         for (k, ed) in &md.keys {
                             if !cur.contains_key(k) {
@@ -465,34 +479,25 @@ impl<S: DagStruct> Graph<S> {
                                     .is_some_and(|id| ed.nested.borrow().contains_key(&id))
                                 || ed.ports.borrow().contains(&trigger)
                             {
-                                to_process.push((k.clone(), cur[k].clone()));
+                                keys.push(k.clone());
                             }
                         }
                     }
-                    (to_process, removed_keys)
+                    (keys, removed_keys)
                 };
 
-                let mut wrote = false;
-                for (k, e) in to_process {
-                    let ports_rc = gref.ensure_elem_ports::<K>(map_id, k.clone());
-                    let nested = gref.ensure_elem_nested::<K>(map_id, k.clone());
-                    let mut e2 = e;
-                    {
-                        let fired = Rc::new(RefCell::new(HashSet::new()));
-                        let mut eref = DagStructRef::new_with(&mut e2, ports_rc, fired, nested);
-                        let fresh = full || md.keys.get(&k).map_or(false, |ed| ed.added || ed.full);
-                        path.descend(&mut eref, gpu, fresh, trigger, &mut leaf);
-                    }
-                    // Processed keys are always written back (like
-                    // `run_map_fanout`), so the map is marked dirty and
-                    // downstream readers re-run.
-                    map.read_mut_state(gref.inner_mut()).insert(k, e2);
-                    wrote = true;
+                // Process in place through the widget-side `MapEntry` path:
+                // `dagref` borrows the live element, shares its port-dirty set
+                // and nested store with the graph, and marks the map port
+                // dirty — the same marks the old write-back produced, minus
+                // the clone and the write-back.
+                for k in &keys {
+                    let Some(mut entry) = map.get(gref, k.clone()) else { continue };
+                    let mut eref = entry.dagref();
+                    let fresh = full || md.keys.get(k).map_or(false, |ed| ed.added || ed.full);
+                    path.descend(&mut eref, gpu, fresh, trigger, &mut leaf);
                 }
                 if !removed_keys.is_empty() {
-                    wrote = true;
-                }
-                if wrote {
                     gref.mark_dirty(map_id);
                 }
             },
@@ -590,8 +595,10 @@ pub trait RenderPath<T>: Clone + 'static {
     /// (fresh element, whole-map write, or first run). `trigger` is the leaf
     /// read port id: at the bottom level, an element whose ports contain it
     /// (a chained stage or widget-side [`MapEntry::dagref`] write) is
-    /// reprocessed even when the element itself is not fresh. Returns true
-    /// when any element was written back.
+    /// reprocessed even when the element itself is not fresh. Elements are
+    /// processed **in place** — borrowed from their map, mutated by `leaf`,
+    /// never cloned or written back. Returns true when any element was
+    /// processed or any key was removed.
     fn descend(
         &self,
         gref: &mut DagStructRef<T>,
@@ -670,12 +677,14 @@ where
         let next_map_id = self.next.map_id();
         let bottom = next_map_id.is_none();
 
-        let (to_process, removed_keys): (Vec<(K, E)>, Vec<K>) = {
+        // Keys only — the elements are processed in place below, so each map
+        // level costs O(keys) clones instead of O(element) clones.
+        let (keys, removed_keys): (Vec<K>, Vec<K>) = {
             let cur: &HashMap<K, E> = self.map.read(gref);
-            let mut to_process = Vec::new();
+            let mut keys = Vec::new();
             let mut removed_keys = Vec::new();
             if full {
-                to_process.extend(cur.iter().map(|(k, v)| (k.clone(), v.clone())));
+                keys.extend(cur.keys().cloned());
             } else {
                 for (k, ed) in &md.keys {
                     if !cur.contains_key(k) {
@@ -689,36 +698,23 @@ where
                         || next_map_id.is_some_and(|id| ed.nested.borrow().contains_key(&id))
                         || (bottom && ed.ports.borrow().contains(&trigger))
                     {
-                        to_process.push((k.clone(), cur[k].clone()));
+                        keys.push(k.clone());
                     }
                 }
             }
-            (to_process, removed_keys)
+            (keys, removed_keys)
         };
 
-        let mut wrote = false;
-        for (k, e) in to_process {
-            let ports_rc = gref.ensure_elem_ports::<K>(self.map.id(), k.clone());
-            let nested = gref.ensure_elem_nested::<K>(self.map.id(), k.clone());
-            let mut e2 = e;
-            {
-                let fired = Rc::new(RefCell::new(HashSet::new()));
-                let mut eref = DagStructRef::new_with(&mut e2, ports_rc, fired, nested);
-                let fresh = full || md.keys.get(&k).map_or(false, |ed| ed.added || ed.full);
-                self.next.descend(&mut eref, gpu, fresh, trigger, leaf);
-            }
-            // Processed keys are always written back (like `run_map_fanout`),
-            // so the parent map is marked dirty and downstream readers re-run.
-            self.map.read_mut_state(gref.inner_mut()).insert(k, e2);
-            wrote = true;
+        for k in &keys {
+            let Some(mut entry) = self.map.get(gref, k.clone()) else { continue };
+            let mut eref = entry.dagref();
+            let fresh = full || md.keys.get(k).map_or(false, |ed| ed.added || ed.full);
+            self.next.descend(&mut eref, gpu, fresh, trigger, leaf);
         }
         if !removed_keys.is_empty() {
-            wrote = true;
-        }
-        if wrote {
             gref.mark_dirty(self.map.id());
         }
-        wrote
+        !keys.is_empty() || !removed_keys.is_empty()
     }
 
     fn collect(

@@ -161,7 +161,7 @@ fn find_context_target<S>(
         }),
         ViewportNode::Split(split) => {
             let inner = split_margin_rect(rect, split.dir);
-            let (r0, r1) = split_rects(inner, split.dir, split.ratio);
+            let (r0, r1) = split_rects(split, inner, state);
             if let Some(menu) = find_context_target(&split.children[0], r0, pos, state) {
                 return Some(menu);
             }
@@ -247,7 +247,7 @@ fn execute_split<S>(
     match node {
         ViewportNode::Split(split) => {
             let inner = split_margin_rect(rect, split.dir);
-            let (r0, r1) = split_rects(inner, split.dir, split.ratio);
+            let (r0, r1) = split_rects(split, inner, state);
             execute_split(&mut split.children[0], r0, target_rect, dir, state);
             execute_split(&mut split.children[1], r1, target_rect, dir, state);
         }

@@ -16,7 +16,8 @@ use crate::gui::event::InputEvent;
 pub trait AppRunner<S: DagStruct> {
     /// Called after the DAG tick completes. The runner inspects state and
     /// returns events to inject. In `step()` these events are processed at
-    /// the start of the next `step()` call.
+    /// the start of the next `step()` call; in `run()` at the start of the
+    /// next redraw.
     fn after_tick(&mut self, _ctx: &AppContext<'_, S>) -> Vec<InputEvent> {
         vec![]
     }

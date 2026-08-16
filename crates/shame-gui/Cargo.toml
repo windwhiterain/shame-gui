@@ -14,6 +14,11 @@ shame_gui_derive = { path = "../shame_gui_derive" }
 taffy.workspace = true
 glyphon.workspace = true
 cosmic-text.workspace = true
+sys-locale = "0.3.2"
+raw-window-handle = "0.6"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_UI_Input_Pointer", "Win32_UI_Input_Touch", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 image = { version = "0.25.10", default-features = false, features = ["png"] }

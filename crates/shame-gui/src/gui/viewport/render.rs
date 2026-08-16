@@ -10,8 +10,8 @@ use crate::sm;
 use crate::text::TextObject;
 
 use super::layout::{
-    container_table_rects, divider_hit, divider_rect, split_margin_rect, split_rects, tab_bar_rect,
-    tab_content_rect,
+    container_table_rects, divider_hit, divider_rect, effective_ratio, split_margin_rect,
+    split_ratio_range, split_rects, tab_bar_rect, tab_content_rect,
 };
 use super::node::{SplitDir, ViewportNode};
 
@@ -43,11 +43,11 @@ pub fn walk_render<S>(
             render_node_outline(ctx, rect);
             let inner = split_margin_rect(rect, split.dir);
             ctx.fills.push(RectEntry {
-                rect: divider_rect(inner, split.dir, split.ratio),
+                rect: divider_rect(split, inner, state),
                 color: style::DIVIDER.to_linear(),
                 z: style::Z_DIVIDER,
             });
-            let (r0, r1) = split_rects(inner, split.dir, split.ratio);
+            let (r0, r1) = split_rects(split, inner, state);
             walk_render(&split.children[0], r0, ctx, state);
             walk_render(&split.children[1], r1, ctx, state);
         }
@@ -153,7 +153,7 @@ pub fn walk_event<S>(
         }
         ViewportNode::Split(split) => {
             let inner = split_margin_rect(rect, split.dir);
-            let (r0, r1) = split_rects(inner, split.dir, split.ratio);
+            let (r0, r1) = split_rects(split, inner, state);
             if walk_event(&mut split.children[0], r0, event, focus, state)
                 == EventResponse::Consumed
                 && !visit_all
@@ -322,10 +322,12 @@ pub fn find_split_divider<S>(
     match node {
         ViewportNode::Split(split) => {
             let inner = split_margin_rect(rect, split.dir);
-            if divider_hit(inner, split.dir, split.ratio, pos, 4.0) {
-                return Some((inner, split.dir, split.ratio));
+            if divider_hit(split, inner, pos, 4.0, state) {
+                // The drag starts from the effective ratio — the rendered
+                // divider position — so grabbing it never jumps.
+                return Some((inner, split.dir, effective_ratio(split, inner, state)));
             }
-            let (r0, r1) = split_rects(inner, split.dir, split.ratio);
+            let (r0, r1) = split_rects(split, inner, state);
             if r0.contains(pos) {
                 if let Some(found) = find_split_divider(&split.children[0], r0, pos, state) {
                     return Some(found);
@@ -381,11 +383,15 @@ pub fn apply_drag<S>(
                     SplitDir::Vertical => inner.size.y,
                 };
                 if extent > 0.0 {
-                    split.ratio = (drag.start_ratio + delta / extent).clamp(0.1, 0.9);
+                    // Clamp to the children's taffy minimums, not the old
+                    // hard [0.1, 0.9]: a pane can only be shrunk as far as
+                    // its own min size allows.
+                    let (lo, hi) = split_ratio_range(split, inner, state);
+                    split.ratio = (drag.start_ratio + delta / extent).clamp(lo, hi);
                 }
                 return;
             }
-            let (r0, r1) = split_rects(inner, split.dir, split.ratio);
+            let (r0, r1) = split_rects(split, inner, state);
             apply_drag(&mut split.children[0], r0, drag, pos, state);
             apply_drag(&mut split.children[1], r1, drag, pos, state);
         }
